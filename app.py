@@ -74,26 +74,10 @@ underbilling_documentation = [
     "The 'Time Entry Description' provides context for why certain time entries might be underbilled, such as non-billable activities."
 ]
 
-legal_billing_terms = [
-    "MT# or Matter# means \"Matter ID\" in legal billing data",
-    "MT Name means \"Matter Name\" in legal billing data",
-    "MT Off or Loc means \"Matter Office\" in legal billing data",
-    "MT Dept means \"Matter Department\" in legal billing data",
-    "MT PG or Matter PG means \"Matter Practice Group\" in legal billing data",
-    "MT Type means \"Matter Type\" in legal billing data",
-    "Batty or billing atty means \"Billing Attorney\" in legal billing data",
-    "Supatty or supatty means \"Supervising Attorney\" in legal billing data",
-    "Respaty or respatty means \"Responsible Attorney\" in legal billing data",
-    "Orig atty or orig means \"Originating Attorney\" in legal billing data",
-    "Pro atty or proatty means \"Proliferating Attorney\" in legal billing data",
-    "Task Description means \"Time Entry Description\" in legal billing data",
-    "When users say 'Active', search for 'Open' in \"Matter Status\""
-]
-
 for sql, question in underbilling_sql_training:
     vn.train(sql=sql, question=question)
 
-for doc in underbilling_documentation + legal_billing_terms:
+for doc in underbilling_documentation:
     vn.train(documentation=doc)
 
 app = FastAPI(title="Underbilling Agent API")
@@ -115,3 +99,7 @@ def ask(request: AskRequest):
     if df is not None and not df.empty:
         return {"data": df.to_dict(orient="records")}
     return {"data": [], "message": "No results returned"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
