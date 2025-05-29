@@ -1,13 +1,13 @@
 import os
-import sqlite3
 import pandas as pd
 from dotenv import load_dotenv
 from vanna.openai import OpenAI_Chat
 from vanna.chromadb import ChromaDB_VectorStore
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-import tempfile
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv()
 
@@ -45,105 +45,160 @@ vn.connect_to_postgres(
 
 underbilling_sql_training = [
     (
-        "SELECT lb.\"Timekeeper Name\", SUM(lb.\"Write Off Amount\") AS total_write_off "
-        "FROM legal_billing lb "
-        "JOIN timekeeper_details td ON lb.\"Timekeeper ID\" = td.\"Timekeeper ID\" "
-        "WHERE lb.\"Invoice Date\" >= current_date - interval '3 months' "
-        "GROUP BY lb.\"Timekeeper Name\" "
-        "HAVING SUM(lb.\"Write Off Amount\") > 1000 "
-        "ORDER BY total_write_off DESC;",
-        "Which timekeepers have a total write-off amount greater than $1000 in the last quarter?"
+        'SELECT t."timekeeper_name", ROUND(SUM(mts."standard_amount" - mts."worked_amount")::numeric, 2) AS total_underbilling '
+        'FROM "matter_timekeeper_summary" mts '
+        'JOIN "timekeeper" t ON mts."timekeeper_id" = t."timekeeper_id" '
+        'WHERE mts."year" = 2025 '
+        'AND t."is_active" = \'Y\' '
+        'AND mts."is_error" = \'N\' '
+        'GROUP BY t."timekeeper_name" '
+        'ORDER BY total_underbilling DESC '
+        'LIMIT 5;',
+        "Which timekeepers have the highest total underbilling amount in 2025?"
     ),
     (
-        "SELECT td.\"Timekeeper Role\", AVG(lb.\"Realization Rate\") AS avg_realization "
-        "FROM legal_billing lb "
-        "JOIN timekeeper_details td ON lb.\"Timekeeper ID\" = td.\"Timekeeper ID\" "
-        "GROUP BY td.\"Timekeeper Role\";",
-        "What is the average realization rate for each timekeeper role?"
+        'SELECT m."matter_name", ROUND(SUM(mts."standard_amount" - mts."worked_amount")::numeric, 2) AS total_underbilling '
+        'FROM "matter_timekeeper_summary" mts '
+        'JOIN "matter" m ON mts."matter_id" = m."matter_id" '
+        'WHERE mts."year" = 2025 '
+        'AND m."is_active" = \'Y\' '
+        'AND mts."is_error" = \'N\' '
+        'GROUP BY m."matter_name" '
+        'ORDER BY total_underbilling DESC '
+        'LIMIT 5;',
+        "Which matters have the highest underbilling amount in 2025?"
     ),
     (
-        "SELECT lb.\"Matter Name\", lb.\"Billed Hours\", lb.\"Worked Hours\" "
-        "FROM legal_billing lb "
-        "WHERE lb.\"Billed Hours\" < 0.5 * lb.\"Worked Hours\";",
-        "List matters where billed hours are less than 50% of worked hours."
+        'SELECT t."timekeeper_name", ROUND(AVG(mts."worked_amount" / NULLIF(mts."standard_amount", 0) * 100)::numeric, 2) AS avg_realization_rate '
+        'FROM "matter_timekeeper_summary" mts '
+        'JOIN "timekeeper" t ON mts."timekeeper_id" = t."timekeeper_id" '
+        'WHERE mts."year" = 2025 '
+        'AND t."is_active" = \'Y\' '
+        'AND mts."is_error" = \'N\' '
+        'GROUP BY t."timekeeper_name" '
+        'HAVING AVG(mts."worked_amount" / NULLIF(mts."standard_amount", 0) * 100) < 80 '
+        'ORDER BY avg_realization_rate ASC;',
+        "Which timekeepers have an average realization rate below 80% in 2025?"
     ),
     (
-        "SELECT lb.\"Client Name\", AVG(lb.\"Discount Amount\") AS avg_discount "
-        "FROM legal_billing lb "
-        "GROUP BY lb.\"Client Name\" "
-        "HAVING AVG(lb.\"Discount Amount\") > 500;",
-        "Which clients have an average discount amount greater than $500?"
+        'SELECT c."client_name", ROUND(AVG(rd."deviation_amount")::numeric, 2) AS avg_discount_amount '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        'AND c."is_active" = \'Y\' '
+        'GROUP BY c."client_name" '
+        'HAVING AVG(rd."deviation_amount") > 1000 '
+        'ORDER BY avg_discount_amount DESC;',
+        "Which clients have an average discount amount greater than $1,000 in 2025?"
     ),
     (
-        "SELECT lb.\"Timekeeper Name\", COUNT(*) AS underbilled_matters "
-        "FROM legal_billing lb "
-        "WHERE lb.\"Underbilling Flag\" = 'Yes' "
-        "GROUP BY lb.\"Timekeeper Name\";",
-        "How many matters have an underbilling flag set to 'Yes' for each timekeeper?"
+        'SELECT m."matter_name", '
+        'ROUND((SUM(CASE WHEN tc."is_non_billable" = \'Y\' THEN tc."worked_hours" ELSE 0 END) / NULLIF(SUM(tc."worked_hours"), 0) * 100)::numeric, 2) AS non_billable_percentage '
+        'FROM "timecard" tc '
+        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
+        'WHERE tc."date" >= \'2025-01-01\' '
+        'AND tc."date" < \'2026-01-01\' '
+        'AND tc."is_active" = \'Y\' '
+        'AND m."is_active" = \'Y\' '
+        'GROUP BY m."matter_name" '
+        'HAVING (SUM(CASE WHEN tc."is_non_billable" = \'Y\' THEN tc."worked_hours" ELSE 0 END) / NULLIF(SUM(tc."worked_hours"), 0)) > 0.3 '
+        'ORDER BY non_billable_percentage DESC;',
+        "Which matters have more than 30% of their timecard hours marked as non-billable in 2025?"
     ),
     (
-        "SELECT lb.\"Matter Type\", AVG(lb.\"Write Off Amount\" + lb.\"Discount Amount\") AS avg_underbilling "
-        "FROM legal_billing lb "
-        "GROUP BY lb.\"Matter Type\";",
-        "What is the average underbilling amount for each matter type?"
+        'SELECT t."timekeeper_name", COUNT(tc."timecard_id") AS underbilled_timecards '
+        'FROM "timecard" tc '
+        'JOIN "timekeeper" t ON tc."timekeeper_id" = t."timekeeper_id" '
+        'WHERE tc."date" >= \'2025-01-01\' '
+        'AND tc."date" < \'2026-01-01\' '
+        'AND tc."worked_rate" < 0.75 * tc."standard_rate" '
+        'AND tc."is_active" = \'Y\' '
+        'AND tc."is_non_billable" = \'N\' '
+        'AND tc."is_no_charge" = \'N\' '
+        'AND t."is_active" = \'Y\' '
+        'GROUP BY t."timekeeper_name" '
+        'ORDER BY underbilled_timecards DESC '
+        'LIMIT 5;',
+        "Which timekeepers have the most timecards with worked rates below 75% of standard rates in 2025?"
     ),
     (
-        "SELECT lb.\"Timekeeper Name\", AVG(lb.\"Utilization Rate\") AS avg_utilization "
-        "FROM legal_billing lb "
-        "GROUP BY lb.\"Timekeeper Name\" "
-        "HAVING AVG(lb.\"Utilization Rate\") < 50;",
-        "Which timekeepers have an average utilization rate below 50?"
+        'SELECT m."type" AS matter_type, ROUND(AVG(mts."standard_amount" - mts."worked_amount")::numeric, 2) AS avg_underbilling '
+        'FROM "matter_timekeeper_summary" mts '
+        'JOIN "matter" m ON mts."matter_id" = m."matter_id" '
+        'WHERE mts."year" = 2025 '
+        'AND m."is_active" = \'Y\' '
+        'AND mts."is_error" = \'N\' '
+        'GROUP BY m."type" '
+        'ORDER BY avg_underbilling DESC;',
+        "Which matter types have the highest average underbilling amount in 2025?"
     ),
     (
-        "SELECT lb.\"Timekeeper Name\", "
-        "COUNT(CASE WHEN lb.\"Underbilling Flag\" = 'Yes' THEN 1 END) AS underbilling_count, "
-        "AVG(lb.\"Realization Rate\") AS avg_realization "
-        "FROM legal_billing lb "
-        "GROUP BY lb.\"Timekeeper Name\" "
-        "HAVING COUNT(CASE WHEN lb.\"Underbilling Flag\" = 'Yes' THEN 1 END) > 5 "
-        "AND AVG(lb.\"Realization Rate\") < 80;",
-        "List timekeepers who have both a high number of underbilling flags and a low average realization rate."
+        'SELECT c."client_name", ROUND(SUM(mts."standard_amount" - mts."worked_amount")::numeric, 2) AS total_underbilling '
+        'FROM "matter_timekeeper_summary" mts '
+        'JOIN "matter" m ON mts."matter_id" = m."matter_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE mts."year" = 2025 '
+        'AND c."is_active" = \'Y\' '
+        'AND mts."is_error" = \'N\' '
+        'GROUP BY c."client_name" '
+        'ORDER BY total_underbilling DESC '
+        'LIMIT 5;',
+        "Which clients have the highest total underbilling amount in 2025?"
     ),
     (
-        "SELECT lb.\"Matter Name\", lb.\"Effective Rate\", lb.\"Standard Rate\", lb.\"Time Entry Hours\" "
-        "FROM legal_billing lb "
-        "WHERE lb.\"Effective Rate\" < 0.8 * lb.\"Standard Rate\" "
-        "AND lb.\"Time Entry Hours\" > 5;",
-        "Identify matters where the effective rate is less than 80% of the standard rate and the time entry hours are greater than 5."
+        'SELECT m."matter_name", ROUND(AVG(rd."deviation_percent" * 100)::numeric, 2) AS avg_discount_percent '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        'AND m."is_active" = \'Y\' '
+        'GROUP BY m."matter_name" '
+        'HAVING AVG(rd."deviation_percent" * 100) > 20 '
+        'ORDER BY avg_discount_percent DESC;',
+        "Which matters have a high discount percentage greater than 20% in 2025?"
     ),
     (
-        "SELECT lb.\"Matter Name\", lb.\"Billed Amount\", lb.\"Collected Amount\" "
-        "FROM legal_billing lb "
-        "WHERE lb.\"Collected Amount\" < 0.9 * lb.\"Billed Amount\";",
-        "Which matters have a collected amount less than 90% of the billed amount?"
-    ),
-    (
-        "SELECT lb.\"Timekeeper Name\", "
-        "AVG(lb.\"Billed Hours\" / NULLIF(lb.\"Time Entry Hours\", 0)) AS avg_ratio "
-        "FROM legal_billing lb "
-        "GROUP BY lb.\"Timekeeper Name\";",
-        "What is the average ratio of billed hours to time entry hours for each timekeeper?"
+        'SELECT t."timekeeper_name", COUNT(*) AS error_timecards '
+        'FROM "timecard" tc '
+        'JOIN "timekeeper" t ON tc."timekeeper_id" = t."timekeeper_id" '
+        'WHERE tc."worked_amount" > tc."standard_amount" '
+        'AND tc."date" >= \'2025-01-01\' '
+        'AND tc."date" < \'2026-01-01\' '
+        'AND tc."is_active" = \'Y\' '
+        'AND tc."is_non_billable" = \'N\' '
+        'AND t."is_active" = \'Y\' '
+        'GROUP BY t."timekeeper_name" '
+        'ORDER BY error_timecards DESC;',
+        "Which timekeepers have errors in their timecards where the worked amount exceeds the standard amount in 2025?"
     )
 ]
 
 underbilling_documentation = [
-    "Underbilling occurs when the billed amount is less than the expected amount based on the time worked or standard rates. This can be due to discounts, write-offs, or other adjustments.",
-    "The 'Write Off Amount' column indicates the amount that was not billed to the client, which can be a sign of underbilling.",
-    "The 'Realization Rate' is the percentage of the billed amount that was actually collected, which can indicate underbilling if it’s consistently low.",
-    "The 'Underbilling Flag' is a direct indicator of whether underbilling was detected for a particular matter.",
-    "The 'Timekeeper Role' can be used to analyze if certain roles (e.g., Partner, Paralegal) are more prone to underbilling.",
-    "The 'Matter Type' might influence underbilling likelihood, as some types (e.g., Litigation) may have more variable billing.",
-    "The 'Client ID' and 'Client Name' can help identify if certain clients are associated with more underbilling.",
-    "The 'Effective Rate' is calculated as the billed amount divided by the billed hours, which can be compared to the 'Standard Rate' to detect underbilling.",
-    "The 'Utilization Rate' shows how much of a timekeeper’s available time is billed; low rates might suggest underbilling.",
-    "The 'Time Entry Description' provides context for why certain time entries might be underbilled, such as non-billable activities."
+    "Underbilling occurs when the billed amount is less than the expected amount based on time worked or standard rates, often due to lower rates, discounts, non-billable hours, or no-charge entries.",
+    "In the \"timecard\" table, \"worked\"_amount\" (based on \"worked\"_rate\") is the actual billed amount, while \"standard\"_amount\" (based on \"standard\"_rate\") is the expected amount. If \"worked\" is less than \"standard\", underbilling is likely.",
+    "The \"deviation_amount\" and \"deviation_percent\" in \"rate_detail\" represent discounts applied to rates, reducing billed amounts and contributing to underbilling.",
+    "Realization rate, calculated as \"worked_amount\" / \"standard\" / \"standard_amount\" * amount\", from \"matter_timekeeper_summary\", is low (e.g., < 80%) when underbilling occurs.",
+    "Timecards with \"is\"_nonbillable\" = 'Y'\' or \"_is\"_no_charge\" = 'Y'\")' in \"timecard\" represent hours worked but not billed, a form of underbilling.",
+    "The \"type\"_\" column in \"timekeeper\", indicating roles like Partner or Associate, is useful for analyzing underbilling trends.",
+    "The \"type\" column in \"matter\" categorizes matters (e.g., Litigation, Patent Filing), helping identify underbilling patterns by matter type.",
+    "The \"client\"_name\" in \"client\" links to matters, aiding in spotting clients with frequent underbilling issues.",
+    "Comparing \"worked\"_rate\" to \"standard\"_rate\" in \"timecard\" to \"reveals rate reductions leading to underbilling.",
+    "Data errors, such as \"worked\"_amount\" exceeding \"_standard\"amount\" in \"amount\", in \"timecard\" can obscure underbilling and need investigation."
 ]
-
 for sql, question in underbilling_sql_training:
     vn.train(sql=sql, question=question)
 
 for doc in underbilling_documentation:
     vn.train(documentation=doc)
+
 
 app = FastAPI(title="Underbilling Agent API")
 
@@ -158,12 +213,26 @@ app.add_middleware(
 class AskRequest(BaseModel):
     question: str
 
+# Use a thread pool executor to run blocking vn.ask() calls asynchronously
+executor = ThreadPoolExecutor(max_workers=4)
+
 @app.post("/ask")
-def ask(request: AskRequest):
-    df = vn.ask(request.question)
-    if df is not None and not df.empty:
-        return {"data": df.to_dict(orient="records")}
-    return {"data": [], "message": "No results returned"}
+async def ask(request: AskRequest):
+    loop = asyncio.get_event_loop()
+    try:
+        # Run the blocking vn.ask() in a thread to avoid blocking the event loop
+        df = await loop.run_in_executor(executor, vn.ask, request.question)
+        if df is None:
+            return {"data": [], "message": "No results returned"}
+        if df.empty:
+            return {"data": [], "message": "No results returned"}
+        # Limit output size to avoid large payloads
+        limited_df = df.head(100)
+        return {"data": limited_df.to_dict(orient="records")}
+    except Exception as e:
+        # Log the error and return a 500 response with error message
+        print(f"Exception in /ask endpoint: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
