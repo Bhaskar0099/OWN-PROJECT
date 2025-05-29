@@ -38,8 +38,8 @@ vn = MyVanna(config={
 vn.connect_to_postgres(
     host=os.getenv('POSTGRES_HOST'),
     dbname=os.getenv('POSTGRES_DB'),
-    user=os.getenv('POSTGRES_USER'),
-    password=os.getenv('POSTGRES_PASSWORD'),
+    user=os.getenv('UNDERBILLING_USER'),
+    password=os.getenv('UNDERBILLING_PASSWORD'),
     port=int(os.getenv('POSTGRES_PORT', 5432))
 )
 

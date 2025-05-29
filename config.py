@@ -1,24 +1,72 @@
-import pandas as pd
-from sqlalchemy import create_engine
+import psycopg2
+import os
+import yaml
+from psycopg2 import sql
+from dotenv import load_dotenv
 
-# Load the CSV file
-file_path = '/home/bhaskar/Downloads/U_A/Underbilling-Agent/data/data.csv'
-df = pd.read_csv(file_path)
+# Load environment variables
+load_dotenv()
 
-# Database connection configuration
-db_user = 'postgres'
-db_password = '123456'
-db_host = 'localhost'  # or your remote host
-db_port = '5432'
-db_name = 'WyzeAssist'
+# Load YAML config
+with open("agent_access_config.yaml", "r") as f:
+    config = yaml.safe_load(f)
 
-# Create a connection string
-connection_string = f'postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}'
+# PostgreSQL connection
+conn = psycopg2.connect(
+    dbname=os.getenv("POSTGRES_DB"),
+    user=os.getenv("POSTGRES_USER"),
+    password=os.getenv("POSTGRES_PASSWORD"),
+    host=os.getenv("POSTGRES_HOST"),
+    port=os.getenv("POSTGRES_PORT")
+)
+conn.autocommit = True
+cursor = conn.cursor()
 
-# Create SQLAlchemy engine
-engine = create_engine(connection_string)
+for agent_name, agent_data in config["agents"].items():
+    role_env_var = agent_data["role_env"]
+    role = os.getenv(role_env_var)
+    password_env_var = agent_data["password_env"]
+    password = os.getenv(password_env_var)
 
-# Push the DataFrame to PostgreSQL
-df.to_sql('timekeeper_details', engine, if_exists='replace', index=False)
+    if not role:
+        print(f"[ERROR] Role not found for {agent_name}. Set {role_env_var} in .env")
+        continue
+    if not password:
+        print(f"[ERROR] Password not found for {agent_name}. Set {password_env_var} in .env")
+        continue
 
-print("Data pushed to PostgreSQL table 'legal_billing' successfully!")
+    print(f"🔧 Setting up role: {role}")
+
+    try:
+        # Create role if not exists
+        cursor.execute(sql.SQL("DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = %s) THEN CREATE ROLE {} LOGIN PASSWORD %s; END IF; END $$;").format(sql.Identifier(role)), [role, password])
+    except Exception as e:
+        print(f"[ERROR] Failed to create role {role}: {e}")
+        continue
+
+    try:
+        # Grant connect and usage
+        cursor.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {};").format(
+            sql.Identifier(os.getenv("POSTGRES_DB")),
+            sql.Identifier(role)
+        ))
+        cursor.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {};").format(sql.Identifier(role)))
+    except Exception as e:
+        print(f"[ERROR] Failed to grant DB/schema access to {role}: {e}")
+        continue
+
+    # Grant table/column access
+    for table_name, columns in agent_data["tables"].items():
+        try:
+            grant_stmt = sql.SQL("GRANT SELECT ({}) ON public.{} TO {};").format(
+                sql.SQL(', ').join(map(sql.Identifier, columns)),
+                sql.Identifier(table_name),
+                sql.Identifier(role)
+            )
+            cursor.execute(grant_stmt)
+            print(f"✅ Granted access on {table_name}: {columns}")
+        except Exception as e:
+            print(f"[ERROR] Failed to grant access on {table_name} to {role}: {e}")
+
+cursor.close()
+conn.close()

@@ -11,17 +11,6 @@ import tempfile
 
 load_dotenv()
 
-def load_data():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    csv_path = os.path.join(base_dir, 'data', 'updated_synthetic_legal_billing_data copy1.csv')
-    temp_dir = tempfile.mkdtemp()
-    db_path = os.path.join(temp_dir, 'legal_billing.db')
-    df = pd.read_csv(csv_path)
-    conn = sqlite3.connect(db_path)
-    df.to_sql('legal_billing', conn, if_exists='replace', index=False)
-    conn.close()
-    return db_path
-
 class MyVanna(ChromaDB_VectorStore, OpenAI_Chat):
     def __init__(self, config=None):
         ChromaDB_VectorStore.__init__(self, config=config)
@@ -29,7 +18,14 @@ class MyVanna(ChromaDB_VectorStore, OpenAI_Chat):
         self._last_query_df = None
 
     def ask(self, question, **kwargs):
-        sql, df, _ = super().ask(question, **kwargs)
+        result = super().ask(question, **kwargs)
+        if result is None:
+            return None
+        if isinstance(result, tuple) and len(result) >= 2:
+            sql, df = result[0], result[1]
+        else:
+            df = result
+            sql = None
         self._last_query_df = df
         return df
 
@@ -39,15 +35,15 @@ vn = MyVanna(config={
     'embedding_model': 'text-embedding-3-small'
 })
 
-db_path = load_data()
-vn.connect_to_sqlite(db_path)
+vn.connect_to_postgres(
+    host=os.getenv('POSTGRES_HOST'),
+    dbname=os.getenv('POSTGRES_DB'),
+    user=os.getenv('PROFITABILITY_USER'),
+    password=os.getenv('PROFITABILITY_PASSWORD'),
+    port=int(os.getenv('POSTGRES_PORT', 5432))
+)
 
-schema_sql = "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL"
-df_ddl = vn.run_sql(schema_sql)
-for ddl in df_ddl['sql'].dropna():
-    vn.train(ddl=ddl)
-
-    profitability_risk_sql_training = [
+profitability_risk_sql_training = [
     (
         """
         SELECT practice_area,
@@ -146,7 +142,7 @@ for ddl in df_ddl['sql'].dropna():
 ]
 
     # Documentation training examples
-    profitability_risk_documentation = [
+profitability_risk_documentation = [
     "Profitability risks in legal billing are identified by high discount percentages (discount_amount / original_amount > 25%), low realization rates (realized_amount / billed_amount < 80%), or extended collection times (high collection_days).",
     "The 'practice_area' column categorizes matters into areas like Litigation, Corporate, IP, Tax, or Employment, and is used to group data for profitability analysis.",
     "The 'original_amount' is the initial amount before discounts, used to calculate discount percentages.",
@@ -192,4 +188,4 @@ def ask(request: AskRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8084)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
