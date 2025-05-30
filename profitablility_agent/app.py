@@ -46,118 +46,109 @@ vn.connect_to_postgres(
 profitability_risk_sql_training = [
     (
         """
-        SELECT practice_area,
-               ROUND(AVG(discount_amount / NULLIF(original_amount, 0) * 100), 2) AS avg_discount_pct,
-               ROUND(AVG(realized_amount / NULLIF(billed_amount, 0) * 100), 2) AS avg_realization_pct,
-               ROUND(AVG(collection_days), 2) AS avg_collection_days
+        SELECT "Matter Practice Group",
+               ROUND(SUM("Discount Amount") / NULLIF(SUM("Billed Amount") + SUM("Discount Amount"), 0) * 100, 2) AS discount_pct,
+               ROUND(SUM("Collected Amount") / NULLIF(SUM("Billed Amount"), 0) * 100, 2) AS realization_pct
         FROM legal_billing
-        GROUP BY practice_area
-        HAVING avg_discount_pct > 25 OR avg_realization_pct < 80
-        ORDER BY avg_discount_pct DESC, avg_realization_pct ASC;
+        GROUP BY "Matter Practice Group"
+        HAVING discount_pct > 25 OR realization_pct < 80
+        ORDER BY discount_pct DESC, realization_pct ASC;
         """,
-        "Show practice areas with high profitability risks based on discounts or realization rates."
+        "Which matter practice groups have high discount percentages or low realization rates?"
     ),
     (
         """
-        SELECT practice_area,
-               SUM(discount_amount) AS total_discount,
-               SUM(billed_amount) AS total_billed,
-               ROUND(SUM(discount_amount) / NULLIF(SUM(billed_amount) + SUM(discount_amount), 0) * 100, 2) AS discount_pct
+        SELECT "Client ID", "Client Name",
+               ROUND(SUM("Discount Amount") / NULLIF(SUM("Billed Amount"), 0) * 100, 2) AS client_discount_pct
         FROM legal_billing
-        GROUP BY practice_area
-        HAVING discount_pct > 25
-        ORDER BY discount_pct DESC;
+        GROUP BY "Client ID", "Client Name"
+        HAVING client_discount_pct > 25
+        ORDER BY client_discount_pct DESC;
         """,
-        "Which practice areas have an average discount percentage greater than 25%?"
+        "List clients with discount percentages higher than 25%."
     ),
     (
         """
-        SELECT practice_area,
-               ROUND(AVG(realized_amount / NULLIF(billed_amount, 0) * 100), 2) AS avg_realization_pct
+        SELECT "Matter Office", 
+               ROUND(SUM("Write Off Amount") / NULLIF(SUM("Billed Amount"), 0) * 100, 2) AS write_off_pct
         FROM legal_billing
-        GROUP BY practice_area
-        HAVING avg_realization_pct < 80
-        ORDER BY avg_realization_pct ASC;
+        GROUP BY "Matter Office"
+        HAVING write_off_pct > 10
+        ORDER BY write_off_pct DESC;
         """,
-        "List practice areas with average realization rates below 80%."
+        "Which offices have high write-off percentages?"
     ),
     (
         """
-        SELECT practice_area,
-               ROUND(AVG(collection_days), 2) AS avg_collection_days
+        SELECT "Matter Department", 
+               ROUND(SUM("Collected Amount") / NULLIF(SUM("Billed Amount"), 0) * 100, 2) AS realization_rate
         FROM legal_billing
-        GROUP BY practice_area
-        ORDER BY avg_collection_days DESC;
+        GROUP BY "Matter Department"
+        ORDER BY realization_rate ASC;
         """,
-        "What is the average collection time for each practice area?"
+        "Show departments with lowest realization rates."
     ),
     (
         """
-        SELECT practice_area,
-               SUM(write_off_amount) AS total_write_off,
-               ROUND(AVG(write_off_amount / NULLIF(billed_amount, 0) * 100), 2) AS avg_write_off_pct
+        SELECT "Timekeeper Role",
+               ROUND(AVG("Effective Rate"), 2) AS avg_effective_rate
         FROM legal_billing
-        GROUP BY practice_area
-        HAVING avg_write_off_pct > 10
-        ORDER BY total_write_off DESC;
+        JOIN timekeeper_details USING ("Timekeeper ID")
+        GROUP BY "Timekeeper Role"
+        ORDER BY avg_effective_rate DESC;
         """,
-        "Identify practice areas with high write-off amounts relative to billed amounts."
+        "What is the average effective rate by timekeeper role?"
     ),
     (
         """
-        SELECT practice_area,
+        SELECT "Matter Type",
                COUNT(*) AS matter_count,
-               ROUND(AVG(discount_amount), 2) AS avg_discount
+               ROUND(AVG("Billed Hours"), 2) AS avg_billed_hours,
+               ROUND(AVG("Worked Hours"), 2) AS avg_worked_hours
         FROM legal_billing
-        WHERE matter_date >= date('now', '-1 year')
-        GROUP BY practice_area
-        ORDER BY avg_discount DESC;
+        GROUP BY "Matter Type"
+        ORDER BY matter_count DESC;
         """,
-        "Show the number of matters and average discount for each practice area in the last year."
+        "Which matter types are most common, and what are their average billed and worked hours?"
     ),
     (
         """
-        SELECT practice_area,
-               ROUND(AVG(realized_amount / NULLIF(billed_amount, 0) * 100), 2) AS avg_realization_pct,
-               ROUND(AVG(collection_days), 2) AS avg_collection_days
+        SELECT "Billing Attorney",
+               ROUND(AVG("Effective Rate"), 2) AS avg_effective_rate
         FROM legal_billing
-        WHERE lawyer_role = 'Partner'
-        GROUP BY practice_area
-        HAVING avg_realization_pct < 80;
+        GROUP BY "Billing Attorney"
+        ORDER BY avg_effective_rate DESC
+        LIMIT 10;
         """,
-        "Which practice areas have low realization rates for matters handled by Partners?"
+        "Who are the top 10 billing attorneys with the highest average effective rates?"
     ),
     (
         """
-        SELECT client_id,
-               practice_area,
-               ROUND(SUM(discount_amount) / NULLIF(SUM(original_amount), 0) * 100, 2) AS discount_pct
+        SELECT "Matter ID", "Matter Name", 
+               "Billed Amount", "Collected Amount", 
+               ROUND("Collected Amount" / NULLIF("Billed Amount", 0) * 100, 2) AS realization_pct
         FROM legal_billing
-        GROUP BY client_id, practice_area
-        HAVING discount_pct > 25
-        ORDER BY discount_pct DESC;
+        ORDER BY realization_pct ASC
+        LIMIT 10;
         """,
-        "List clients with high discount percentages by practice area."
+        "Which matters have the lowest realization rates?"
     )
 ]
 
     # Documentation training examples
 profitability_risk_documentation = [
-    "Profitability risks in legal billing are identified by high discount percentages (discount_amount / original_amount > 25%), low realization rates (realized_amount / billed_amount < 80%), or extended collection times (high collection_days).",
-    "The 'practice_area' column categorizes matters into areas like Litigation, Corporate, IP, Tax, or Employment, and is used to group data for profitability analysis.",
-    "The 'original_amount' is the initial amount before discounts, used to calculate discount percentages.",
-    "The 'discount_amount' is the amount reduced from the original_amount, critical for identifying high-discount risks.",
-    "The 'billed_amount' is the amount invoiced to the client (original_amount - discount_amount), used in realization rate calculations.",
-    "The 'realized_amount' is the amount actually collected, used to compute realization rates (realized_amount / billed_amount).",
-    "The 'collection_days' column indicates the number of days to collect payment, with higher values signaling potential cash flow risks.",
-    "The 'write_off_amount' is the uncollected amount written off, indicating financial loss in a practice area.",
-    "The 'matter_date' is the billing date, useful for time-based filtering (e.g., last year’s data).",
-    "The 'client_id' identifies the client, allowing analysis of client-specific profitability risks.",
-    "The 'lawyer_role' indicates the lawyer’s role (e.g., Partner, Associate), useful for role-based profitability analysis.",
-    "The 'firm_specific_code' is a unique matter identifier used internally by the firm.",
-    "When analyzing profitability, focus on patterns across practice areas, such as consistently high discounts or low realization rates, to identify systemic risks.",
-    "Compare discount percentages and realization rates against thresholds (25% for discounts, 80% for realization) to flag risky practice areas.",
-    "Long collection days may indicate client payment issues or inefficiencies in billing processes.",
+    "Profitability is affected by high discount percentages and low realization rates, derived from billed and collected amounts.",
+    "The 'Discount Amount' column reflects revenue lost due to fee reductions.",
+    "The 'Billed Amount' is the amount invoiced to the client before collections or write-offs.",
+    "The 'Collected Amount' shows what was actually received, helping calculate realization rate.",
+    "The 'Write Off Amount' indicates uncollected revenue that was written off.",
+    "The 'Effective Rate' reflects the true billing rate after discounts and adjustments, used to evaluate profitability per timekeeper or attorney.",
+    "Grouping by 'Matter Practice Group' or 'Matter Department' helps identify which areas are more or less profitable.",
+    "The 'Timekeeper Role' and 'Timekeeper Practice Group' provide insight into performance by staff type or group.",
+    "Client-level analysis using 'Client ID' and 'Client Name' helps identify accounts with frequent underperformance.",
+    "Attorney-specific fields like 'Billing Attorney' or 'Responsible Attorney' can highlight who is managing profitable (or unprofitable) matters.",
+    "Realization Rate = Collected Amount / Billed Amount, and it's a key metric for profitability.",
+    "Discount Percentage = Discount Amount / (Billed Amount + Discount Amount), showing how much is written off up front."
 ]
 
 for sql, question in profitability_risk_sql_training:

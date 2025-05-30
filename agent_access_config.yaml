@@ -13,7 +13,7 @@ agents:
         - "worked_amount"
         - "standard_rate"
         - "standard_amount"
-        - "is_non_billable"
+        - "is_nonbillable"
         - "is_no_charge"
         - "is_active"
       matter_timekeeper_summary:
@@ -86,7 +86,7 @@ agents:
         - "worked_amount"
         - "standard_rate"
         - "standard_amount"
-        - "is_non_billable"
+        - "is_nonbillable"
         - "is_no_charge"
         - "is_active"
       matter_timekeeper_summary:

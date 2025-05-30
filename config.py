@@ -58,6 +58,22 @@ for agent_name, agent_data in config["agents"].items():
     # Grant table/column access
     for table_name, columns in agent_data["tables"].items():
         try:
+            # Check if table exists in public schema
+            cursor.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables 
+                    WHERE table_schema = 'public' AND table_name = %s
+                );
+                """,
+                [table_name]
+            )
+            table_exists = cursor.fetchone()[0]
+            if not table_exists:
+                print(f"[WARNING] Skipping {table_name}: Table does not exist in public schema.")
+                continue
+
+            # Now grant column-level SELECT access
             grant_stmt = sql.SQL("GRANT SELECT ({}) ON public.{} TO {};").format(
                 sql.SQL(', ').join(map(sql.Identifier, columns)),
                 sql.Identifier(table_name),
@@ -65,8 +81,10 @@ for agent_name, agent_data in config["agents"].items():
             )
             cursor.execute(grant_stmt)
             print(f"✅ Granted access on {table_name}: {columns}")
+
         except Exception as e:
             print(f"[ERROR] Failed to grant access on {table_name} to {role}: {e}")
+
 
 cursor.close()
 conn.close()
