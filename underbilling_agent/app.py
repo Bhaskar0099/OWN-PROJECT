@@ -43,6 +43,41 @@ vn.connect_to_postgres(
     port=int(os.getenv('POSTGRES_PORT', 5432))
 )
 
+get_tables_sql = """
+SELECT table_name 
+FROM information_schema.tables 
+WHERE table_schema = 'public' AND table_type = 'BASE TABLE';
+"""
+df_tables = vn.run_sql(get_tables_sql)
+
+# Step 3: Loop through each table, get its columns, print, and train
+for table in df_tables['table_name']:
+    print(f"\n📘 Table: {table}")
+    
+    get_columns_sql = f"""
+    SELECT column_name, data_type, is_nullable
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = '{table}';
+    """
+    df_columns = vn.run_sql(get_columns_sql)
+
+    # Print column details
+    for _, row in df_columns.iterrows():
+        print(f" - Column: {row['column_name']}, Type: {row['data_type']}, Nullable: {row['is_nullable']}")
+
+    # Step 4: Construct a DDL string
+    ddl_parts = []
+    for _, row in df_columns.iterrows():
+        col = row['column_name']
+        dtype = row['data_type'].upper()
+        nullable = 'NOT NULL' if row['is_nullable'] == 'NO' else ''
+        ddl_parts.append(f'"{col}" {dtype} {nullable}'.strip())
+
+    ddl_statement = f'CREATE TABLE {table} (\n  ' + ',\n  '.join(ddl_parts) + '\n);'
+
+    # Step 5: Train Vanna with the generated DDL
+    vn.train(ddl=ddl_statement)
+
 underbilling_sql_training = [
     (
         'SELECT t."timekeeper_name", ROUND(SUM(mts."standard_amount" - mts."worked_amount")::numeric, 2) AS total_underbilling '
@@ -98,7 +133,7 @@ underbilling_sql_training = [
     ),
     (
         'SELECT m."matter_name", '
-        'ROUND((SUM(CASE WHEN tc."is_non_billable" = \'Y\' THEN tc."worked_hours" ELSE 0 END) / NULLIF(SUM(tc."worked_hours"), 0) * 100)::numeric, 2) AS non_billable_percentage '
+        'ROUND((SUM(CASE WHEN tc."is_nonbillable" = \'Y\' THEN tc."worked_hours" ELSE 0 END) / NULLIF(SUM(tc."worked_hours"), 0) * 100)::numeric, 2) AS non_billable_percentage '
         'FROM "timecard" tc '
         'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
         'WHERE tc."date" >= \'2025-01-01\' '
@@ -106,7 +141,7 @@ underbilling_sql_training = [
         'AND tc."is_active" = \'Y\' '
         'AND m."is_active" = \'Y\' '
         'GROUP BY m."matter_name" '
-        'HAVING (SUM(CASE WHEN tc."is_non_billable" = \'Y\' THEN tc."worked_hours" ELSE 0 END) / NULLIF(SUM(tc."worked_hours"), 0)) > 0.3 '
+        'HAVING (SUM(CASE WHEN tc."is_nonbillable" = \'Y\' THEN tc."worked_hours" ELSE 0 END) / NULLIF(SUM(tc."worked_hours"), 0)) > 0.3 '
         'ORDER BY non_billable_percentage DESC;',
         "Which matters have more than 30% of their timecard hours marked as non-billable in 2025?"
     ),
@@ -118,7 +153,7 @@ underbilling_sql_training = [
         'AND tc."date" < \'2026-01-01\' '
         'AND tc."worked_rate" < 0.75 * tc."standard_rate" '
         'AND tc."is_active" = \'Y\' '
-        'AND tc."is_non_billable" = \'N\' '
+        'AND tc."is_nonbillable" = \'N\' '
         'AND tc."is_no_charge" = \'N\' '
         'AND t."is_active" = \'Y\' '
         'GROUP BY t."timekeeper_name" '
@@ -173,7 +208,7 @@ underbilling_sql_training = [
         'AND tc."date" >= \'2025-01-01\' '
         'AND tc."date" < \'2026-01-01\' '
         'AND tc."is_active" = \'Y\' '
-        'AND tc."is_non_billable" = \'N\' '
+        'AND tc."is_nonbillable" = \'N\' '
         'AND t."is_active" = \'Y\' '
         'GROUP BY t."timekeeper_name" '
         'ORDER BY error_timecards DESC;',
