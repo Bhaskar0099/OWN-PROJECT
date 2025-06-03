@@ -1,9 +1,0 @@
-fastapi
-uvicorn
-pydantic
-pandas
-python-dotenv
-openai
-chromadb
-vanna
-psycopg2-binary
