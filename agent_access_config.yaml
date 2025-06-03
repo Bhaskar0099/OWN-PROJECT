@@ -147,3 +147,52 @@ agents:
         - "rate_year_max"
         - "arrangement"
         - "practice_group"
+
+  profitability_risks_by_practice_area_agent:
+    role_env: PROFITABILITY_USER
+    password_env: PROFITABILITY_PASSWORD
+    tables:
+      matter_date:
+        - "matter_id"
+        - "practice"
+        - "start_date"
+        - "end_date"
+      matter:
+        - "matter_id"
+        - "client_id"
+        - "is_active"
+        - "matter_currency"
+        - "type"
+        - "category"
+      timecard:
+        - "timecard_id"
+        - "matter_id"
+        - "date"
+        - "worked_amount"
+        - "standard_amount"
+        - "is_active"
+        - "is_nonbillable"
+      matter_timekeeper_summary:
+        - "tk_mat_sum_id"
+        - "matter_id"
+        - "year"
+        - "worked_amount"
+        - "standard_amount"
+        - "currency"
+        - "is_error"
+      rate_detail:
+        - "rate_detail_id"
+        - "rate_component_id"
+        - "deviation_percent"
+        - "start_date"
+        - "end_date"
+      rate_set_link:
+        - "rate_set_link_id"
+        - "rate_set_id"
+        - "rate_component_id"
+      rate_set:
+        - "rate_set_id"
+      client:
+        - "client_id"
+        - "client_name"
+        - "is_active"
