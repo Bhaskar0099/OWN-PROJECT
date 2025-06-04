@@ -198,8 +198,8 @@ agents:
         - "is_active"
 
   cross_matter_rate_consistency_agent:
-    role_env: CROSS_MATTER_RATE_CONSISTENCY_USER
-    password_env: CROSS_MATTER_RATE_CONSISTENCY_PASSWORD
+    role_env: CROSS_MATTER_AGENT_USER
+    password_env: CROSS_MATTER_AGENT_PASSWORD
     tables:
       rate_detail:
         - "rate_detail_id"

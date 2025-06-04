@@ -19,6 +19,8 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 import openai
+import math
+from fastapi.responses import JSONResponse
 
 # ───────────────────────────────────────────────────────────────────
 # Prevent Plotly from auto‐opening a browser:
@@ -91,8 +93,8 @@ vn = MyVanna(config={
 vn.connect_to_postgres(
     host=os.getenv('POSTGRES_HOST'),
     dbname=os.getenv('POSTGRES_DB'),
-    user=os.getenv('UNDERBILLING_USER'),
-    password=os.getenv('UNDERBILLING_PASSWORD'),
+    user=os.getenv('PROFITABILITY_USER'),
+    password=os.getenv('PROFITABILITY_PASSWORD'),
     port=int(os.getenv('POSTGRES_PORT', 5432))
 )
 
@@ -649,47 +651,47 @@ async def serve_chart(chart_id: str):
 async def ask(request: Request, payload: AskRequest):
     loop = asyncio.get_event_loop()
     try:
-        # Run the blocking vn.ask(...) in a separate thread
+        # 1. Run Vanna in a separate thread
         out = await loop.run_in_executor(executor, vn.ask, payload.question)
 
-        # If Vanna returned None (no DataFrame), short-circuit
         if out is None:
-            return {"data": [], "chart_url": None, "message": "No results returned"}
+            return JSONResponse({"data": [], "chart_url": None, "message": "No results returned"})
 
-        df, fig_from_vanna = out  # df is DataFrame, fig_from_vanna may be a Plotly Figure or None
-
+        df, fig_from_vanna = out
         if df is None or df.empty:
-            return {"data": [], "chart_url": None, "message": "No results returned"}
+            return JSONResponse({"data": [], "chart_url": None, "message": "No results returned"})
 
-        # ─────── LIMIT THE ROWS HERE ───────
+        # 2. Limit to 10 rows
         limited_df = df.head(10)
-        # ────────────────────────────────────
 
-        # Convert up to 100 rows to a JSON‐serializable list of dicts
+        # 3. Convert to object dtype and replace NaN → None
+        limited_df = limited_df.astype(object).where(pd.notnull(limited_df), None)
+
+        # 4. Convert to list-of-dicts
         records = limited_df.to_dict(orient="records")
 
-        # If Vanna already gave us a Figure, use it.
+        # 5. Final pass: any float('nan') → None (just in case)
+        clean_records = []
+        for row in records:
+            clean_row = {}
+            for key, val in row.items():
+                if isinstance(val, float) and math.isnan(val):
+                    clean_row[key] = None
+                else:
+                    clean_row[key] = val
+            clean_records.append(clean_row)
+        records = clean_records
+
+        # 6. Chart construction (unchanged)
         if isinstance(fig_from_vanna, _bdt.BaseFigure) or isinstance(fig_from_vanna, go.Figure):
-            fig = fig_from_vanna
-
-            # But make sure the figure’s data matches our limited_df
-            # (In many cases, Vanna’s own code already filtered down to an appropriate subset,
-            #  so you might not need to re-build it. If you do want to “rebind” it to limited_df,”
-            #  you’d have to replicate the same chart type logic Vanna chose. In practice,
-            #  most of the time Vanna’s Figure was already built from a narrower subset.)
-
-            # We’ll assume Vanna’s fig is “final.” Convert to HTML now:
-            html_str = fig.to_html(include_plotlyjs="cdn")
-
+            html_str = fig_from_vanna.to_html(include_plotlyjs="cdn")
         else:
-            # Vanna did NOT produce a Figure. Build a fallback bar chart on limited_df:
             if len(limited_df.columns) >= 2:
                 x_col = limited_df.columns[0]
                 y_col = limited_df.columns[1]
                 fig = px.bar(limited_df, x=x_col, y=y_col, title=f"{y_col} by {x_col}")
                 html_str = fig.to_html(include_plotlyjs="cdn")
             else:
-                # Not enough columns to make a chart
                 html_str = None
 
         if html_str:
@@ -699,24 +701,20 @@ async def ask(request: Request, payload: AskRequest):
         else:
             chart_url = None
 
+        # 7. Summarization (unchanged)
         summary = None
         try:
-            # Construct the chat message
             system_msg = (
                 "You are a data‐analysis assistant. "
                 "When given a user’s question and a JSON array of row objects, "
                 "your task is to produce a concise, narrative summary: "
-                "focus on overall patterns, counts, and high-level insights rather than listing each row in detail."
+                "focus on overall patterns, counts, and high‐level insights rather than listing each row."
             )
-
             user_msg = (
                 f"Here is the user’s question: {payload.question}\n\n"
-                f"Below are up to 100 rows of raw results (in JSON array format):\n{records}\n\n"
-                "Please read these rows and respond with a brief narrative explanation. "
-                "Highlight any notable trends, how many times something occurred, and what it implies, "
-                "without enumerating each individual entry."
+                f"Below are up to 10 rows of raw results (in JSON array format):\n{records}\n\n"
+                "Please respond with a brief narrative explanation."
             )
-
             response = await loop.run_in_executor(
                 executor,
                 lambda: openai.chat.completions.create(
@@ -724,15 +722,12 @@ async def ask(request: Request, payload: AskRequest):
                     temperature=0.0,
                     messages=[
                         {"role": "system", "content": system_msg},
-                        {"role": "user", "content": user_msg},
+                        {"role": "user",   "content": user_msg},
                     ],
                 )
             )
-
             summary = response.choices[0].message.content.strip()
-
         except Exception as summary_err:
-            # If summarization fails (e.g. rate limit), we can log it and continue
             print(f"Warning: summarization error: {summary_err}")
             summary = None
 

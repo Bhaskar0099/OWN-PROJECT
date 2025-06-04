@@ -19,6 +19,8 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 import openai
+import math
+from fastapi.responses import JSONResponse
 
 # ───────────────────────────────────────────────────────────────────
 # Prevent Plotly from auto‐opening a browser:
@@ -91,15 +93,14 @@ vn = MyVanna(config={
 vn.connect_to_postgres(
     host=os.getenv('POSTGRES_HOST'),
     dbname=os.getenv('POSTGRES_DB'),
-    user=os.getenv('UNDERBILLING_USER'),
-    password=os.getenv('UNDERBILLING_PASSWORD'),
+    user=os.getenv('CROSS_MATTER_AGENT_USER'),
+    password=os.getenv('CROSS_MATTER_AGENT_PASSWORD'),
     port=int(os.getenv('POSTGRES_PORT', 5432))
 )
 
-
 cross_matter_rate_consistency_sql_training = [
     (
-        'SELECT c."client_name", m."matter_name", ROUND(rd."deviation_percent" * 100::numeric, 2) AS discount_percent '
+        'SELECT c."client_name", m."matter_name", ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
@@ -107,15 +108,15 @@ cross_matter_rate_consistency_sql_training = [
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'JOIN "client" c ON m."client_id" = c."client_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
-        'AND rd."deviation_percent" > 0.20 '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rd."deviation_percent" > 0.20 '
         'ORDER BY c."client_name", discount_percent DESC;',
         "Which matters have discounts greater than 20% for active clients in 2025?"
     ),
     (
-        'SELECT c."client_name", ROUND(AVG(rd."deviation_percent" * 100)::numeric, 2) AS avg_discount_percent '
+        'SELECT c."client_name", ROUND(AVG((rd."deviation_percent" * 100)::numeric), 2) AS avg_discount_percent '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
@@ -123,9 +124,9 @@ cross_matter_rate_consistency_sql_training = [
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'JOIN "client" c ON m."client_id" = c."client_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
         'GROUP BY c."client_name" '
         'ORDER BY avg_discount_percent DESC '
         'LIMIT 5;',
@@ -133,19 +134,19 @@ cross_matter_rate_consistency_sql_training = [
     ),
     (
         'WITH client_avg AS ('
-        'SELECT m."client_id", AVG(rd."deviation_percent" * 100) AS avg_discount '
-        'FROM "rate_detail" rd '
-        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
-        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
-        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
-        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
-        'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'GROUP BY m."client_id" '
+        '  SELECT m."client_id", AVG(rd."deviation_percent" * 100) AS avg_discount '
+        '  FROM "rate_detail" rd '
+        '  JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        '  JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        '  JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        '  JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        '  WHERE rd."start_date" <= \'2025-12-31\' '
+        '    AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '    AND m."is_active" = \'Y\' '
+        '  GROUP BY m."client_id" '
         ') '
-        'SELECT c."client_name", m."matter_name", ROUND(rd."deviation_percent" * 100::numeric, 2) AS discount_percent, '
-        'ROUND(ABS(rd."deviation_percent" * 100 - ca.avg_discount)::numeric, 2) AS deviation_from_avg '
+        'SELECT c."client_name", m."matter_name", ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent, '
+        '       ROUND(ABS(rd."deviation_percent" * 100 - ca.avg_discount)::numeric, 2) AS deviation_from_avg '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
@@ -154,29 +155,29 @@ cross_matter_rate_consistency_sql_training = [
         'JOIN "client" c ON m."client_id" = c."client_id" '
         'JOIN client_avg ca ON m."client_id" = ca."client_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
-        'AND ABS(rd."deviation_percent" * 100 - ca.avg_discount) > 10 '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND ABS(rd."deviation_percent" * 100 - ca.avg_discount) > 10 '
         'ORDER BY deviation_from_avg DESC;',
         "Which matters have discounts deviating by more than 10% from their client’s average discount in 2025?"
     ),
     (
-        'SELECT rd."practice_group", ROUND(AVG(rd."deviation_percent" * 100)::numeric, 2) AS avg_discount_percent '
+        'SELECT rd."practice_group", ROUND(AVG((rd."deviation_percent" * 100)::numeric), 2) AS avg_discount_percent '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
         'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
         'GROUP BY rd."practice_group" '
         'ORDER BY avg_discount_percent DESC;',
         "Which practice areas have the highest average discount percentage in 2025?"
     ),
     (
-        'SELECT c."client_name", rd."practice_group", m."matter_name", ROUND(rd."deviation_percent" * 100::numeric, 2) AS discount_percent '
+        'SELECT c."client_name", rd."practice_group", m."matter_name", ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
@@ -184,29 +185,29 @@ cross_matter_rate_consistency_sql_training = [
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'JOIN "client" c ON m."client_id" = c."client_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
-        'AND rd."deviation_percent" < 0.05 '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rd."deviation_percent" < 0.05 '
         'ORDER BY c."client_name", rd."practice_group", discount_percent;',
         "Which matters have discounts below 5% for active clients, grouped by practice area in 2025?"
     ),
     (
         'WITH practice_avg AS ('
-        'SELECT rd."practice_group", AVG(rd."deviation_percent" * 100) AS avg_discount '
-        'FROM "rate_detail" rd '
-        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
-        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
-        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
-        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
-        'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'GROUP BY rd."practice_group" '
+        '  SELECT rd."practice_group", AVG(rd."deviation_percent" * 100) AS avg_discount '
+        '  FROM "rate_detail" rd '
+        '  JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        '  JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        '  JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        '  JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        '  WHERE rd."start_date" <= \'2025-12-31\' '
+        '    AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '    AND m."is_active" = \'Y\' '
+        '  GROUP BY rd."practice_group" '
         ') '
         'SELECT c."client_name", rd."practice_group", m."matter_name", '
-        'ROUND(rd."deviation_percent" * 100::numeric, 2) AS discount_percent, '
-        'ROUND(ABS(rd."deviation_percent" * 100 - pa.avg_discount)::numeric, 2) AS deviation_from_practice_avg '
+        '       ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent, '
+        '       ROUND(ABS(rd."deviation_percent" * 100 - pa.avg_discount)::numeric, 2) AS deviation_from_practice_avg '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
@@ -215,16 +216,16 @@ cross_matter_rate_consistency_sql_training = [
         'JOIN "client" c ON m."client_id" = c."client_id" '
         'JOIN practice_avg pa ON rd."practice_group" = pa."practice_group" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
-        'AND ABS(rd."deviation_percent" * 100 - pa.avg_discount) > 15 '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND ABS(rd."deviation_percent" * 100 - pa.avg_discount) > 15 '
         'ORDER BY deviation_from_practice_avg DESC;',
         "Which matters have discounts deviating by more than 15% from their practice area’s average in 2025?"
     ),
     (
         'SELECT c."client_name", COUNT(DISTINCT m."matter_id") AS matter_count, '
-        'ROUND(AVG(rd."deviation_percent" * 100)::numeric, 2) AS avg_discount_percent '
+        '       ROUND(AVG((rd."deviation_percent" * 100)::numeric), 2) AS avg_discount_percent '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
@@ -232,9 +233,9 @@ cross_matter_rate_consistency_sql_training = [
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'JOIN "client" c ON m."client_id" = c."client_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
         'GROUP BY c."client_name" '
         'HAVING COUNT(DISTINCT m."matter_id") > 5 '
         'ORDER BY avg_discount_percent DESC;',
@@ -249,35 +250,35 @@ cross_matter_rate_consistency_sql_training = [
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'JOIN "client" c ON m."client_id" = c."client_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
-        'AND rd."rate_currency" != ('
-        'SELECT MODE() WITHIN GROUP (ORDER BY rd2."rate_currency") '
-        'FROM "rate_detail" rd2 '
-        'JOIN "rate_component" rc2 ON rd2."rate_component_id" = rc2."rate_component_id" '
-        'JOIN "rate_set_link" rsl2 ON rc2."rate_component_id" = rsl2."rate_component_id" '
-        'JOIN "rate_set" rs2 ON rsl2."rate_set_id" = rs2."rate_set_id" '
-        'JOIN "matter" m2 ON rs2."rate_set_id" = m2."rate_set_id" '
-        'WHERE m2."client_id" = m."client_id" '
-        'AND rd2."start_date" <= \'2025-12-31\' '
-        'AND (rd2."end_date" >= \'2025-01-01\' OR rd2."end_date" IS NULL) '
-        'AND m2."is_active" = \'Y\' '
-        ') '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rd."rate_currency" != ('
+        '    SELECT MODE() WITHIN GROUP (ORDER BY rd2."rate_currency") '
+        '    FROM "rate_detail" rd2 '
+        '    JOIN "rate_component" rc2 ON rd2."rate_component_id" = rc2."rate_component_id" '
+        '    JOIN "rate_set_link" rsl2 ON rc2."rate_component_id" = rsl2."rate_component_id" '
+        '    JOIN "rate_set" rs2 ON rsl2."rate_set_id" = rs2."rate_set_id" '
+        '    JOIN "matter" m2 ON rs2."rate_set_id" = m2."rate_set_id" '
+        '    WHERE m2."client_id" = m."client_id" '
+        '      AND rd2."start_date" <= \'2025-12-31\' '
+        '      AND (rd2."end_date" >= \'2025-01-01\' OR rd2."end_date" IS NULL) '
+        '      AND m2."is_active" = \'Y\' '
+        '  ) '
         'ORDER BY c."client_name", m."matter_name";',
         "Which matters have rate currencies different from their client’s most common currency in 2025?"
     ),
     (
         'SELECT rd."practice_group", COUNT(DISTINCT m."matter_id") AS matter_count, '
-        'ROUND(STDDEV(rd."deviation_percent" * 100)::numeric, 2) AS discount_variability '
+        '       ROUND(STDDEV((rd."deviation_percent" * 100)::numeric), 2) AS discount_variability '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
         'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
         'GROUP BY rd."practice_group" '
         'HAVING STDDEV(rd."deviation_percent" * 100) > 5 '
         'ORDER BY discount_variability DESC;',
@@ -285,7 +286,7 @@ cross_matter_rate_consistency_sql_training = [
     ),
     (
         'SELECT c."client_name", m."matter_name", rs."rate_set_name", '
-        'ROUND(rd."deviation_percent" * 100::numeric, 2) AS discount_percent '
+        '       ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
@@ -293,53 +294,54 @@ cross_matter_rate_consistency_sql_training = [
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'JOIN "client" c ON m."client_id" = c."client_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
-        'AND rs."rate_set_name" != ('
-        'SELECT MODE() WITHIN GROUP (ORDER BY rs2."rate_set_name") '
-        'FROM "rate_set" rs2 '
-        'JOIN "matter" m2 ON rs2."rate_set_id" = m2."rate_set_id" '
-        'WHERE m2."client_id" = m."client_id" '
-        'AND m2."is_active" = \'Y\' '
-        ') '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rs."rate_set_name" != ('
+        '    SELECT MODE() WITHIN GROUP (ORDER BY rs2."rate_set_name") '
+        '    FROM "rate_set" rs2 '
+        '    JOIN "matter" m2 ON rs2."rate_set_id" = m2."rate_set_id" '
+        '    WHERE m2."client_id" = m."client_id" '
+        '      AND m2."is_active" = \'Y\' '
+        '  ) '
         'ORDER BY c."client_name", discount_percent DESC;',
         "Which matters use a different rate set than their client’s most common rate set in 2025?"
     ),
     (
         'WITH client_practice_avg AS ('
-        'SELECT m."client_id", rd."practice_group", AVG(rd."deviation_percent" * 100) AS avg_discount '
-        'FROM "rate_detail" rd '
-        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
-        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
-        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
-        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
-        'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'GROUP BY m."client_id", rd."practice_group" '
+        '  SELECT m."client_id", rd."practice_group", AVG(rd."deviation_percent" * 100) AS avg_discount '
+        '  FROM "rate_detail" rd '
+        '  JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        '  JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        '  JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        '  JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        '  WHERE rd."start_date" <= \'2025-12-31\' '
+        '    AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '    AND m."is_active" = \'Y\' '
+        '  GROUP BY m."client_id", rd."practice_group" '
         ') '
         'SELECT c."client_name", rd."practice_group", m."matter_name", '
-        'ROUND(rd."deviation_percent" * 100::numeric, 2) AS discount_percent, '
-        'ROUND(ABS(rd."deviation_percent" * 100 - cpa.avg_discount)::numeric, 2) AS deviation_from_avg '
+        '       ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent, '
+        '       ROUND(ABS(rd."deviation_percent" * 100 - cpa.avg_discount)::numeric, 2) AS deviation_from_avg '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
         'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'JOIN "client" c ON m."client_id" = c."client_id" '
-        'JOIN client_practice_avg cpa ON m."client_id" = cpa."client_id" AND rd."practice_group" = cpa."practice_group" '
+        'JOIN client_practice_avg cpa ON m."client_id" = cpa."client_id" '
+        '                       AND rd."practice_group" = cpa."practice_group" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
-        'AND ABS(rd."deviation_percent" * 100 - cpa.avg_discount) > 10 '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND ABS(rd."deviation_percent" * 100 - cpa.avg_discount) > 10 '
         'ORDER BY deviation_from_avg DESC;',
         "Which matters have discounts deviating by more than 10% from their client’s practice area average in 2025?"
     ),
     (
         'SELECT c."client_name", COUNT(DISTINCT rd."practice_group") AS practice_group_count, '
-        'ROUND(AVG(rd."deviation_percent" * 100)::numeric, 2) AS avg_discount_percent '
+        '       ROUND(AVG((rd."deviation_percent" * 100)::numeric), 2) AS avg_discount_percent '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
@@ -347,9 +349,9 @@ cross_matter_rate_consistency_sql_training = [
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'JOIN "client" c ON m."client_id" = c."client_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
         'GROUP BY c."client_name" '
         'HAVING COUNT(DISTINCT rd."practice_group") > 2 '
         'ORDER BY avg_discount_percent DESC;',
@@ -357,7 +359,7 @@ cross_matter_rate_consistency_sql_training = [
     ),
     (
         'SELECT rd."practice_group", c."client_name", m."matter_name", '
-        'ROUND(rd."deviation_percent" * 100::numeric, 2) AS discount_percent '
+        '       ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
@@ -365,16 +367,16 @@ cross_matter_rate_consistency_sql_training = [
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'JOIN "client" c ON m."client_id" = c."client_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
-        'AND rd."deviation_percent" > 0.30 '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rd."deviation_percent" > 0.30 '
         'ORDER BY rd."practice_group", discount_percent DESC;',
         "Which matters in each practice area have discounts above 30% in 2025?"
     ),
     (
         'SELECT c."client_name", m."matter_number", m."matter_name", '
-        'ROUND(rd."deviation_percent" * 100::numeric, 2) AS discount_percent '
+        '       ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
@@ -382,42 +384,43 @@ cross_matter_rate_consistency_sql_training = [
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'JOIN "client" c ON m."client_id" = c."client_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
-        'AND rd."deviation_percent" = 0 '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rd."deviation_percent" = 0 '
         'ORDER BY c."client_name", m."matter_number";',
         "Which matters have no discounts applied for active clients in 2025?"
     ),
     (
-        'SELECT rd."practice_group", ROUND(MIN(rd."deviation_percent" * 100)::numeric, 2) AS min_discount, '
-        'ROUND(MAX(rd."deviation_percent" * 100)::numeric, 2) AS max_discount '
+        'SELECT rd."practice_group", '
+        '       ROUND(MIN((rd."deviation_percent" * 100)::numeric), 2) AS min_discount, '
+        '       ROUND(MAX((rd."deviation_percent" * 100)::numeric), 2) AS max_discount '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
         'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
         'GROUP BY rd."practice_group" '
         'ORDER BY max_discount DESC;',
         "What are the minimum and maximum discount percentages for each practice area in 2025?"
     ),
     (
         'WITH client_discount_rank AS ('
-        'SELECT c."client_name", m."matter_name", rd."deviation_percent" * 100 AS discount_percent, '
-        'RANK() OVER (PARTITION BY m."client_id" ORDER BY rd."deviation_percent" DESC) AS discount_rank '
-        'FROM "rate_detail" rd '
-        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
-        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
-        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
-        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
-        'JOIN "client" c ON m."client_id" = c."client_id" '
-        'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
+        '  SELECT c."client_name", m."matter_name", rd."deviation_percent" * 100 AS discount_percent, '
+        '         RANK() OVER (PARTITION BY m."client_id" ORDER BY rd."deviation_percent" DESC) AS discount_rank '
+        '  FROM "rate_detail" rd '
+        '  JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        '  JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        '  JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        '  JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        '  JOIN "client" c ON m."client_id" = c."client_id" '
+        '  WHERE rd."start_date" <= \'2025-12-31\' '
+        '    AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '    AND m."is_active" = \'Y\' '
+        '    AND c."is_active" = \'Y\' '
         ') '
         'SELECT client_name, matter_name, ROUND(discount_percent::numeric, 2) AS discount_percent '
         'FROM client_discount_rank '
@@ -427,7 +430,7 @@ cross_matter_rate_consistency_sql_training = [
     ),
     (
         'SELECT c."client_name", rd."practice_group", '
-        'ROUND(STDDEV(rd."deviation_percent" * 100)::numeric, 2) AS discount_variability '
+        '       ROUND(STDDEV((rd."deviation_percent" * 100)::numeric), 2) AS discount_variability '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
@@ -435,9 +438,9 @@ cross_matter_rate_consistency_sql_training = [
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'JOIN "client" c ON m."client_id" = c."client_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
         'GROUP BY c."client_name", rd."practice_group" '
         'HAVING STDDEV(rd."deviation_percent" * 100) > 7 '
         'ORDER BY discount_variability DESC;',
@@ -445,7 +448,7 @@ cross_matter_rate_consistency_sql_training = [
     ),
     (
         'SELECT c."client_name", m."matter_name", rd."practice_group", '
-        'ROUND(rd."deviation_percent" * 100::numeric, 2) AS discount_percent '
+        '       ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
@@ -453,27 +456,27 @@ cross_matter_rate_consistency_sql_training = [
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'JOIN "client" c ON m."client_id" = c."client_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
-        'AND rd."deviation_percent" > ('
-        'SELECT AVG(rd2."deviation_percent") + 0.10 '
-        'FROM "rate_detail" rd2 '
-        'JOIN "rate_component" rc2 ON rd2."rate_component_id" = rc2."rate_component_id" '
-        'JOIN "rate_set_link" rsl2 ON rc2."rate_component_id" = rsl2."rate_component_id" '
-        'JOIN "rate_set" rs2 ON rsl2."rate_set_id" = rs2."rate_set_id" '
-        'JOIN "matter" m2 ON rs2."rate_set_id" = m2."rate_set_id" '
-        'WHERE m2."client_id" = m."client_id" '
-        'AND rd2."start_date" <= \'2025-12-31\' '
-        'AND (rd2."end_date" >= \'2025-01-01\' OR rd2."end_date" IS NULL) '
-        'AND m2."is_active" = \'Y\' '
-        ') '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rd."deviation_percent" > ('
+        '    SELECT AVG(rd2."deviation_percent") + 0.10 '
+        '    FROM "rate_detail" rd2 '
+        '    JOIN "rate_component" rc2 ON rd2."rate_component_id" = rc2."rate_component_id" '
+        '    JOIN "rate_set_link" rsl2 ON rc2."rate_component_id" = rsl2."rate_component_id" '
+        '    JOIN "rate_set" rs2 ON rsl2."rate_set_id" = rs2."rate_set_id" '
+        '    JOIN "matter" m2 ON rs2."rate_set_id" = m2."rate_set_id" '
+        '    WHERE m2."client_id" = m."client_id" '
+        '      AND rd2."start_date" <= \'2025-12-31\' '
+        '      AND (rd2."end_date" >= \'2025-01-01\' OR rd2."end_date" IS NULL) '
+        '      AND m2."is_active" = \'Y\' '
+        '  ) '
         'ORDER BY discount_percent DESC;',
         "Which matters have discounts more than 10% above their client’s average discount in 2025?"
     ),
     (
         'SELECT rd."practice_group", COUNT(DISTINCT c."client_id") AS client_count, '
-        'ROUND(AVG(rd."deviation_percent" * 100)::numeric, 2) AS avg_discount_percent '
+        '       ROUND(AVG((rd."deviation_percent" * 100)::numeric), 2) AS avg_discount_percent '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
@@ -481,9 +484,9 @@ cross_matter_rate_consistency_sql_training = [
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'JOIN "client" c ON m."client_id" = c."client_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
         'GROUP BY rd."practice_group" '
         'HAVING COUNT(DISTINCT c."client_id") > 3 '
         'ORDER BY avg_discount_percent DESC;',
@@ -491,7 +494,7 @@ cross_matter_rate_consistency_sql_training = [
     ),
     (
         'SELECT c."client_name", m."matter_name", rd."practice_group", '
-        'ROUND(rd."deviation_percent" * 100::numeric, 2) AS discount_percent '
+        '       ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
@@ -499,27 +502,27 @@ cross_matter_rate_consistency_sql_training = [
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'JOIN "client" c ON m."client_id" = c."client_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
-        'AND rd."deviation_percent" < ('
-        'SELECT AVG(rd2."deviation_percent") - 0.10 '
-        'FROM "rate_detail" rd2 '
-        'JOIN "rate_component" rc2 ON rd2."rate_component_id" = rc2."rate_component_id" '
-        'JOIN "rate_set_link" rsl2 ON rc2."rate_component_id" = rsl2."rate_component_id" '
-        'JOIN "rate_set" rs2 ON rsl2."rate_set_id" = rs2."rate_set_id" '
-        'JOIN "matter" m2 ON rs2."rate_set_id" = m2."rate_set_id" '
-        'WHERE m2."client_id" = m."client_id" '
-        'AND rd2."start_date" <= \'2025-12-31\' '
-        'AND (rd2."end_date" >= \'2025-01-01\' OR rd2."end_date" IS NULL) '
-        'AND m2."is_active" = \'Y\' '
-        ') '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rd."deviation_percent" < ('
+        '    SELECT AVG(rd2."deviation_percent") - 0.10 '
+        '    FROM "rate_detail" rd2 '
+        '    JOIN "rate_component" rc2 ON rd2."rate_component_id" = rc2."rate_component_id" '
+        '    JOIN "rate_set_link" rsl2 ON rc2."rate_component_id" = rsl2."rate_component_id" '
+        '    JOIN "rate_set" rs2 ON rsl2."rate_set_id" = rs2."rate_set_id" '
+        '    JOIN "matter" m2 ON rs2."rate_set_id" = m2."rate_set_id" '
+        '    WHERE m2."client_id" = m."client_id" '
+        '      AND rd2."start_date" <= \'2025-12-31\' '
+        '      AND (rd2."end_date" >= \'2025-01-01\' OR rd2."end_date" IS NULL) '
+        '      AND m2."is_active" = \'Y\' '
+        '  ) '
         'ORDER BY discount_percent ASC;',
         "Which matters have discounts more than 10% below their client’s average discount in 2025?"
     ),
     (
         'SELECT c."client_name", rd."practice_group", m."matter_name", '
-        'ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY rd."deviation_percent" * 100)::numeric, 2) AS median_discount '
+        '       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY rd."deviation_percent" * 100)::numeric, 2) AS median_discount '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
@@ -527,9 +530,9 @@ cross_matter_rate_consistency_sql_training = [
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'JOIN "client" c ON m."client_id" = c."client_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
         'GROUP BY c."client_name", rd."practice_group", m."matter_name" '
         'HAVING PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY rd."deviation_percent" * 100) > 25 '
         'ORDER BY median_discount DESC;',
@@ -537,8 +540,8 @@ cross_matter_rate_consistency_sql_training = [
     ),
     (
         'SELECT c."client_name", m."matter_name", rd."practice_group", '
-        'ROUND(rd."deviation_percent" * 100::numeric, 2) AS discount_percent, '
-        'rs."rate_set_code" '
+        '       ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent, '
+        '       rs."rate_set_code" '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
@@ -546,12 +549,12 @@ cross_matter_rate_consistency_sql_training = [
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'JOIN "client" c ON m."client_id" = c."client_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
-        'AND rsl."start_date" <= EXTRACT(EPOCH FROM \'2025-12-31\'::TIMESTAMP) '
-        'AND (rsl."end_date" >= EXTRACT(EPOCH FROM \'2025-01-01\'::TIMESTAMP) OR rsl."end_date" IS NULL) '
-        'AND rd."deviation_percent" > 0.25 '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rsl."start_date" <= EXTRACT(EPOCH FROM \'2025-12-31\'::TIMESTAMP) '
+        '  AND (rsl."end_date" >= EXTRACT(EPOCH FROM \'2025-01-01\'::TIMESTAMP) OR rsl."end_date" IS NULL) '
+        '  AND rd."deviation_percent" > 0.25 '
         'ORDER BY c."client_name", rd."practice_group", discount_percent DESC;',
         "Which matters with active rate set links have discounts above 25% in 2025?"
     ),
@@ -564,10 +567,10 @@ cross_matter_rate_consistency_sql_training = [
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'JOIN "client" c ON m."client_id" = c."client_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
-        'AND rd."deviation_percent" > 0.20 '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rd."deviation_percent" > 0.20 '
         'GROUP BY rd."practice_group", c."client_name" '
         'HAVING COUNT(DISTINCT m."matter_id") > 2 '
         'ORDER BY matter_count DESC;',
@@ -575,21 +578,22 @@ cross_matter_rate_consistency_sql_training = [
     ),
     (
         'WITH client_discount_stats AS ('
-        'SELECT m."client_id", AVG(rd."deviation_percent" * 100) AS avg_discount, '
-        'STDDEV(rd."deviation_percent" * 100) AS stddev_discount '
-        'FROM "rate_detail" rd '
-        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
-        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
-        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
-        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
-        'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'GROUP BY m."client_id" '
+        '  SELECT m."client_id", '
+        '         AVG(rd."deviation_percent" * 100) AS avg_discount, '
+        '         STDDEV(rd."deviation_percent" * 100) AS stddev_discount '
+        '  FROM "rate_detail" rd '
+        '  JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        '  JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        '  JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        '  JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        '  WHERE rd."start_date" <= \'2025-12-31\' '
+        '    AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '    AND m."is_active" = \'Y\' '
+        '  GROUP BY m."client_id" '
         ') '
         'SELECT c."client_name", m."matter_name", rd."practice_group", '
-        'ROUND(rd."deviation_percent" * 100::numeric, 2) AS discount_percent, '
-        'ROUND((rd."deviation_percent" * 100 - cds.avg_discount) / NULLIF(cds.stddev_discount, 0)::numeric, 2) AS z_score '
+        '       ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent, '
+        '       ROUND((rd."deviation_percent" * 100 - cds.avg_discount) / NULLIF(cds.stddev_discount, 0)::numeric, 2) AS z_score '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
@@ -598,16 +602,16 @@ cross_matter_rate_consistency_sql_training = [
         'JOIN "client" c ON m."client_id" = c."client_id" '
         'JOIN client_discount_stats cds ON m."client_id" = cds."client_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
-        'AND ABS((rd."deviation_percent" * 100 - cds.avg_discount) / NULLIF(cds.stddev_discount, 0)) > 2 '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND ABS((rd."deviation_percent" * 100 - cds.avg_discount) / NULLIF(cds.stddev_discount, 0)) > 2 '
         'ORDER BY z_score DESC;',
         "Which matters have discounts statistically significant (z-score > 2) from their client’s average in 2025?"
     ),
     (
         'SELECT c."client_name", m."matter_name", rd."practice_group", '
-        'ROUND(rd."deviation_percent" * 100::numeric, 2) AS discount_percent '
+        '       ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent '
         'FROM "rate_detail" rd '
         'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
         'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
@@ -615,12 +619,12 @@ cross_matter_rate_consistency_sql_training = [
         'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
         'JOIN "client" c ON m."client_id" = c."client_id" '
         'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
-        'AND rc."start_date" <= \'2025-12-31\' '
-        'AND (rc."end_date" >= \'2025-01-01\' OR rc."end_date" IS NULL) '
-        'AND rd."deviation_percent" > 0.15 '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rc."start_date" <= \'2025-12-31\' '
+        '  AND (rc."end_date" >= \'2025-01-01\' OR rc."end_date" IS NULL) '
+        '  AND rd."deviation_percent" > 0.15 '
         'ORDER BY c."client_name", rd."practice_group", discount_percent DESC;',
         "Which matters with active rate components have discounts above 15% in 2025?"
     )
@@ -710,47 +714,47 @@ async def serve_chart(chart_id: str):
 async def ask(request: Request, payload: AskRequest):
     loop = asyncio.get_event_loop()
     try:
-        # Run the blocking vn.ask(...) in a separate thread
+        # 1. Run Vanna in a separate thread
         out = await loop.run_in_executor(executor, vn.ask, payload.question)
 
-        # If Vanna returned None (no DataFrame), short-circuit
         if out is None:
-            return {"data": [], "chart_url": None, "message": "No results returned"}
+            return JSONResponse({"data": [], "chart_url": None, "message": "No results returned"})
 
-        df, fig_from_vanna = out  # df is DataFrame, fig_from_vanna may be a Plotly Figure or None
-
+        df, fig_from_vanna = out
         if df is None or df.empty:
-            return {"data": [], "chart_url": None, "message": "No results returned"}
+            return JSONResponse({"data": [], "chart_url": None, "message": "No results returned"})
 
-        # ─────── LIMIT THE ROWS HERE ───────
+        # 2. Limit to 10 rows
         limited_df = df.head(10)
-        # ────────────────────────────────────
 
-        # Convert up to 100 rows to a JSON‐serializable list of dicts
+        # 3. Convert to object dtype and replace NaN → None
+        limited_df = limited_df.astype(object).where(pd.notnull(limited_df), None)
+
+        # 4. Convert to list-of-dicts
         records = limited_df.to_dict(orient="records")
 
-        # If Vanna already gave us a Figure, use it.
+        # 5. Final pass: any float('nan') → None (just in case)
+        clean_records = []
+        for row in records:
+            clean_row = {}
+            for key, val in row.items():
+                if isinstance(val, float) and math.isnan(val):
+                    clean_row[key] = None
+                else:
+                    clean_row[key] = val
+            clean_records.append(clean_row)
+        records = clean_records
+
+        # 6. Chart construction (unchanged)
         if isinstance(fig_from_vanna, _bdt.BaseFigure) or isinstance(fig_from_vanna, go.Figure):
-            fig = fig_from_vanna
-
-            # But make sure the figure’s data matches our limited_df
-            # (In many cases, Vanna’s own code already filtered down to an appropriate subset,
-            #  so you might not need to re-build it. If you do want to “rebind” it to limited_df,”
-            #  you’d have to replicate the same chart type logic Vanna chose. In practice,
-            #  most of the time Vanna’s Figure was already built from a narrower subset.)
-
-            # We’ll assume Vanna’s fig is “final.” Convert to HTML now:
-            html_str = fig.to_html(include_plotlyjs="cdn")
-
+            html_str = fig_from_vanna.to_html(include_plotlyjs="cdn")
         else:
-            # Vanna did NOT produce a Figure. Build a fallback bar chart on limited_df:
             if len(limited_df.columns) >= 2:
                 x_col = limited_df.columns[0]
                 y_col = limited_df.columns[1]
                 fig = px.bar(limited_df, x=x_col, y=y_col, title=f"{y_col} by {x_col}")
                 html_str = fig.to_html(include_plotlyjs="cdn")
             else:
-                # Not enough columns to make a chart
                 html_str = None
 
         if html_str:
@@ -760,24 +764,20 @@ async def ask(request: Request, payload: AskRequest):
         else:
             chart_url = None
 
+        # 7. Summarization (unchanged)
         summary = None
         try:
-            # Construct the chat message
             system_msg = (
                 "You are a data‐analysis assistant. "
                 "When given a user’s question and a JSON array of row objects, "
                 "your task is to produce a concise, narrative summary: "
-                "focus on overall patterns, counts, and high-level insights rather than listing each row in detail."
+                "focus on overall patterns, counts, and high‐level insights rather than listing each row."
             )
-
             user_msg = (
                 f"Here is the user’s question: {payload.question}\n\n"
-                f"Below are up to 100 rows of raw results (in JSON array format):\n{records}\n\n"
-                "Please read these rows and respond with a brief narrative explanation. "
-                "Highlight any notable trends, how many times something occurred, and what it implies, "
-                "without enumerating each individual entry."
+                f"Below are up to 10 rows of raw results (in JSON array format):\n{records}\n\n"
+                "Please respond with a brief narrative explanation."
             )
-
             response = await loop.run_in_executor(
                 executor,
                 lambda: openai.chat.completions.create(
@@ -785,15 +785,12 @@ async def ask(request: Request, payload: AskRequest):
                     temperature=0.0,
                     messages=[
                         {"role": "system", "content": system_msg},
-                        {"role": "user", "content": user_msg},
+                        {"role": "user",   "content": user_msg},
                     ],
                 )
             )
-
             summary = response.choices[0].message.content.strip()
-
         except Exception as summary_err:
-            # If summarization fails (e.g. rate limit), we can log it and continue
             print(f"Warning: summarization error: {summary_err}")
             summary = None
 
