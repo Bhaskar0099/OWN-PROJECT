@@ -196,3 +196,41 @@ agents:
         - "client_id"
         - "client_name"
         - "is_active"
+
+  cross_matter_rate_consistency_agent:
+    role_env: CROSS_MATTER_RATE_CONSISTENCY_USER
+    password_env: CROSS_MATTER_RATE_CONSISTENCY_PASSWORD
+    tables:
+      rate_detail:
+        - "rate_detail_id"
+        - "rate_component_id"
+        - "start_date"
+        - "end_date"
+        - "deviation_percent"
+        - "rate_currency"
+        - "practice_group"
+      rate_component:
+        - "rate_component_id"
+        - "start_date"
+        - "end_date"
+      rate_set_link:
+        - "rate_set_link_id"
+        - "rate_set_id"
+        - "rate_component_id"
+        - "start_date"
+        - "end_date"
+      rate_set:
+        - "rate_set_id"
+        - "rate_set_code"
+        - "rate_set_name"
+      matter:
+        - "matter_id"
+        - "matter_number"
+        - "matter_name"
+        - "client_id"
+        - "is_active"
+        - "rate_set_id"
+      client:
+        - "client_id"
+        - "client_name"
+        - "is_active"
