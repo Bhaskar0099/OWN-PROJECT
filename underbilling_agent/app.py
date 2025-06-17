@@ -43,483 +43,546 @@ vn.connect_to_postgres(
     port=int(os.getenv('POSTGRES_PORT', 5432))
 )
 
-underbilling_sql_training = [
+general_query_sql_training = [
+    # Lists Category
     (
-        'SELECT DISTINCT t."timekeeper_name" '
-        'FROM "timecard" tc '
-        'JOIN "timekeeper" t ON tc."timekeeper_id" = t."timekeeper_id" '
-        'WHERE tc."is_nonbillable" = \'Y\' '
-        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
-        'AND tc."is_active" = \'Y\' '
-        'AND t."is_active" = \'Y\' '
-        'ORDER BY t."timekeeper_name";',
-        "Which timekeepers have non-billable hours recorded in 2025?"
+        'SELECT c.client_id, c.client_name, t.timekeeper_name AS relationship_manager, '
+        'COUNT(DISTINCT m.matter_id) AS active_matter_count, '
+        'COALESCE(SUM(mts.worked_amount), 0) AS total_fees_paid, '
+        'STRING_AGG(DISTINCT m.type, \', \') AS legal_service_types, '
+        'MIN(c.open_date) AS relationship_start_date, '
+        'ROUND(EXTRACT(DAY FROM CURRENT_DATE - MIN(c.open_date)) / 365.0, 2) AS relationship_years '
+        'FROM client c '
+        'JOIN timekeeper t ON c.relationship_timekeeper_id = t.timekeeper_id '
+        'LEFT JOIN matter m ON c.client_id = m.client_id AND m.is_active = \'Y\' '
+        'LEFT JOIN matter_timekeeper_summary mts ON m.matter_id = mts.matter_id '
+        'WHERE t.timekeeper_name = \'Lynn Bond\' '
+        'AND c.is_active = \'Y\' '
+        'AND mts.year = EXTRACT(YEAR FROM CURRENT_DATE) '
+        'GROUP BY c.client_id, c.client_name, t.timekeeper_name '
+        'ORDER BY c.client_name;',
+        "List all clients for Lynn, including client names, contact information, active matters, total fees paid to date, and any outstanding balances. Also, provide a summary of the types of legal services provided to each client and the duration of Lynn's relationship with each client."
     ),
     (
-        'SELECT m."matter_name", SUM(tc."worked_hours") AS no_charge_hours '
-        'FROM "timecard" tc '
-        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
-        'WHERE tc."is_no_charge" = \'Y\' '
-        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
-        'AND tc."is_active" = \'Y\' '
-        'AND m."is_active" = \'Y\' '
-        'GROUP BY m."matter_name" '
-        'ORDER BY no_charge_hours DESC '
-        'LIMIT 5;',
-        "Which matters have the most no-charge hours in 2025?"
+        'SELECT c.client_id, c.client_name, m.matter_id, m.matter_name, m.open_date, '
+        'md.office, md.department, md.practice_group, COALESCE(SUM(mts.worked_hours), 0) AS hours_worked, '
+        'STRING_AGG(DISTINCT m.type, \', \') AS legal_service_types '
+        'FROM client c '
+        'JOIN matter m ON c.client_id = m.client_id '
+        'JOIN matter_date md ON m.matter_id = md.matter_id '
+        'LEFT JOIN matter_timekeeper_summary mts ON m.matter_id = mts.matter_id '
+        'WHERE m.open_date >= CURRENT_DATE - INTERVAL \'21 days\' '
+        'AND m.is_active = \'Y\' '
+        'AND c.is_active = \'Y\' '
+        'AND md.end_date IS NULL '
+        'GROUP BY c.client_id, c.client_name, m.matter_id, m.matter_name, m.open_date, md.office, md.department, md.practice_group '
+        'ORDER BY c.client_name, m.open_date;',
+        "Retrieve a detailed list of all new clients and matters opened in the last 21 days for the billing attorney, including client names, matter details, office, department, practice group, total hours worked, and a summary of legal service types provided."
     ),
     (
-        'SELECT c."client_name", ROUND(SUM(mts."standard_amount" - mts."worked_amount")::numeric, 2) AS total_underbilling '
-        'FROM "matter_timekeeper_summary" mts '
-        'JOIN "matter" m ON mts."matter_id" = m."matter_id" '
-        'JOIN "client" c ON m."client_id" = c."client_id" '
-        'WHERE mts."year" = 2025 '
-        'AND mts."is_error" = \'N\' '
-        'AND c."is_active" = \'Y\' '
-        'GROUP BY c."client_name" '
-        'ORDER BY total_underbilling DESC '
-        'LIMIT 5;',
-        "Which clients have the highest total underbilling amount in 2025?"
+        'SELECT t.timekeeper_name AS billing_attorney, COUNT(DISTINCT c.client_id) AS client_count, '
+        'COUNT(DISTINCT m.matter_id) AS matter_count, '
+        'COALESCE(SUM(mts.worked_hours), 0) AS total_hours_worked, '
+        'STRING_AGG(DISTINCT md.practice_group, \', \') AS practice_groups '
+        'FROM matter m '
+        'JOIN timekeeper t ON m.billing_timekeeper_id = t.timekeeper_id '
+        'JOIN client c ON m.client_id = c.client_id '
+        'JOIN matter_date md ON m.matter_id = md.matter_id '
+        'LEFT JOIN matter_timekeeper_summary mts ON m.matter_id = mts.matter_id '
+        'WHERE t.timekeeper_name = \'Lynn Bond\' '
+        'AND m.is_active = \'Y\' '
+        'AND c.is_active = \'Y\' '
+        'AND md.end_date IS NULL '
+        'AND mts.year = EXTRACT(YEAR FROM CURRENT_DATE) '
+        'GROUP BY t.timekeeper_name '
+        'ORDER BY matter_count DESC;',
+        "Provide a comprehensive report on the client and matter load for billing attorney Lynn Bond, including the number of clients, active matters, total hours worked, and a breakdown of practice groups involved."
     ),
     (
-        'SELECT t."timekeeper_name", ROUND(AVG(tc."worked_rate" / NULLIF(tc."standard_rate", 0) * 100)::numeric, 2) AS realization_rate '
-        'FROM "timecard" tc '
-        'JOIN "timekeeper" t ON tc."timekeeper_id" = t."timekeeper_id" '
-        'WHERE EXTRACT(YEAR FROM tc."date") = 2025 '
-        'AND tc."is_active" = \'Y\' '
-        'AND t."is_active" = \'Y\' '
-        'AND tc."is_nonbillable" = \'N\' '
-        'GROUP BY t."timekeeper_name" '
-        'HAVING AVG(tc."worked_rate" / NULLIF(tc."standard_rate", 0) * 100) < 85 '
-        'ORDER BY realization_rate ASC;',
-        "Which timekeepers have an average realization rate below 85% for billable timecards in 2025?"
+        'SELECT md.office, md.department, md.practice_group, '
+        'COUNT(DISTINCT c.client_id) AS client_count, COUNT(DISTINCT m.matter_id) AS matter_count, '
+        'COALESCE(SUM(mts.worked_hours), 0) AS total_hours, '
+        'ROUND((COUNT(DISTINCT m.matter_id) - LAG(COUNT(DISTINCT m.matter_id)) OVER (PARTITION BY md.office ORDER BY md.department)) / '
+        'NULLIF(LAG(COUNT(DISTINCT m.matter_id)) OVER (PARTITION BY md.office ORDER BY md.department), 0)::numeric * 100, 2) AS matter_trend_percent '
+        'FROM matter m '
+        'JOIN matter_date md ON m.matter_id = md.matter_id '
+        'JOIN client c ON m.client_id = c.client_id '
+        'LEFT JOIN matter_timekeeper_summary mts ON m.matter_id = mts.matter_id '
+        'WHERE m.is_active = \'Y\' '
+        'AND c.is_active = \'Y\' '
+        'AND md.end_date IS NULL '
+        'AND mts.year = EXTRACT(YEAR FROM CURRENT_DATE) '
+        'GROUP BY md.office, md.department, md.practice_group '
+        'ORDER BY client_count DESC, matter_count DESC;',
+        "Generate an in-depth load analysis report for clients and matters, grouped by office, department, and practice group, including client and matter counts, total hours worked, and percentage trends in matter counts compared to previous periods."
     ),
     (
-        'SELECT m."matter_name", ROUND(AVG(rd."deviation_amount")::numeric, 2) AS avg_discount '
-        'FROM "rate_detail" rd '
-        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
-        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
-        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
-        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
-        'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'GROUP BY m."matter_name" '
-        'HAVING AVG(rd."deviation_amount") > 500 '
-        'ORDER BY avg_discount DESC;',
-        "Which matters have an average discount amount greater than $500 in 2025?"
+        'SELECT c.client_id, c.client_name, c.category, COUNT(m.matter_id) AS matter_count, '
+        'COALESCE(SUM(mts.worked_amount), 0) AS total_fees, '
+        'STRING_AGG(DISTINCT m.type, \', \') AS service_types '
+        'FROM client c '
+        'LEFT JOIN matter m ON c.client_id = m.client_id AND m.is_active = \'Y\' '
+        'LEFT JOIN matter_timekeeper_summary mts ON m.matter_id = mts.matter_id '
+        'WHERE (c.client_name ILIKE \'%Retail%\' OR c.category ILIKE \'%Retail%\' OR c.type ILIKE \'%Retail%\') '
+        'AND c.is_active = \'Y\' '
+        'AND mts.year = EXTRACT(YEAR FROM CURRENT_DATE) '
+        'GROUP BY c.client_id, c.client_name, c.category '
+        'ORDER BY matter_count DESC;',
+        "Compile a detailed list of clients in the retail sector, identified by client name, category, or type containing 'Retail', including matter counts, total fees paid, and a summary of legal service types provided."
     ),
     (
-        'SELECT t."timekeeper_name", COUNT(tc."timecard_id") AS low_rate_timecards '
-        'FROM "timecard" tc '
-        'JOIN "timekeeper" t ON tc."timekeeper_id" = t."timekeeper_id" '
-        'WHERE tc."worked_rate" < 0.8 * tc."standard_rate" '
-        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
-        'AND tc."is_active" = \'Y\' '
-        'AND tc."is_nonbillable" = \'N\' '
-        'AND tc."is_no_charge" = \'N\' '
-        'AND t."is_active" = \'Y\' '
-        'GROUP BY t."timekeeper_name" '
-        'ORDER BY low_rate_timecards DESC '
-        'LIMIT 5;',
-        "Which timekeepers have the most timecards with rates below 80% of standard rates in 2025?"
+        'SELECT c2.client_id, c2.client_name, t.timekeeper_name AS relationship_manager, '
+        'COUNT(m.matter_id) AS matter_count, '
+        'COALESCE(SUM(mts.worked_amount), 0) AS total_fees, '
+        'MIN(c2.open_date) AS relationship_start '
+        'FROM client c1 '
+        'JOIN client c2 ON c1.related_client_id = c2.related_client_id '
+        'JOIN timekeeper t ON c2.relationship_timekeeper_id = t.timekeeper_id '
+        'LEFT JOIN matter m ON c2.client_id = m.client_id AND m.is_active = \'Y\' '
+        'LEFT JOIN matter_timekeeper_summary mts ON m.matter_id = mts.matter_id '
+        'WHERE c1.client_name ILIKE \'%Pepsi%\' '
+        'AND c1.client_id != c2.client_id '
+        'AND c2.is_active = \'Y\' '
+        'AND mts.year = EXTRACT(YEAR FROM CURRENT_DATE) '
+        'GROUP BY c2.client_id, c2.client_name, t.timekeeper_name '
+        'ORDER BY matter_count DESC;',
+        "Identify all clients related to Pepsi, including their client names, relationship managers, active matter counts, total fees paid, and the start date of their relationship with the firm."
     ),
     (
-        'SELECT m."type", ROUND(SUM(mts."standard_amount" - mts."worked_amount")::numeric, 2) AS total_underbilling '
-        'FROM "matter_timekeeper_summary" mts '
-        'JOIN "matter" m ON mts."matter_id" = m."matter_id" '
-        'WHERE mts."year" = 2025 '
-        'AND mts."is_error" = \'N\' '
-        'AND m."is_active" = \'Y\' '
-        'GROUP BY m."type" '
-        'ORDER BY total_underbilling DESC;',
-        "Which matter types have the highest total underbilling in 2025?"
+        'SELECT c.client_id, c.client_name, t.timekeeper_name AS relationship_manager, '
+        'COUNT(m.matter_id) AS matter_count, '
+        'COALESCE(SUM(mts.worked_amount), 0) AS total_fees, '
+        'STRING_AGG(DISTINCT m.type, \', \') AS service_types '
+        'FROM client c '
+        'JOIN timekeeper t ON c.relationship_timekeeper_id = t.timekeeper_id '
+        'LEFT JOIN matter m ON c.client_id = m.client_id AND m.is_active = \'Y\' '
+        'LEFT JOIN matter_timekeeper_summary mts ON m.matter_id = mts.matter_id '
+        'WHERE c.is_active = \'Y\' '
+        'AND mts.year = EXTRACT(YEAR FROM CURRENT_DATE) '
+        'GROUP BY c.client_id, c.client_name, t.timekeeper_name '
+        'ORDER BY c.client_name;',
+        "Provide a comprehensive list of all active clients, including client names, relationship managers, active matter counts, total fees paid, and a summary of legal service types provided."
+    ),
+    # Flat Fees Category
+    (
+        'SELECT c.client_id, c.client_name, t.timekeeper_name AS billing_attorney, '
+        'COUNT(CASE WHEN m.is_flat_fees = \'N\' THEN m.matter_id END) AS non_flat_fee_matter_count, '
+        'COUNT(CASE WHEN m.is_flat_fees = \'Y\' THEN m.matter_id END) AS flat_fee_matter_count, '
+        'COALESCE(SUM(mts.worked_amount), 0) AS total_fees, '
+        'STRING_AGG(DISTINCT md.practice_group, \', \') AS practice_groups '
+        'FROM client c '
+        'JOIN matter m ON c.client_id = m.client_id '
+        'JOIN timekeeper t ON m.billing_timekeeper_id = t.timekeeper_id '
+        'JOIN matter_date md ON m.matter_id = md.matter_id '
+        'LEFT JOIN matter_timekeeper_summary mts ON m.matter_id = mts.matter_id '
+        'WHERE m.is_active = \'Y\' '
+        'AND c.is_active = \'Y\' '
+        'AND md.end_date IS NULL '
+        'AND mts.year = EXTRACT(YEAR FROM CURRENT_DATE) '
+        'GROUP BY c.client_id, c.client_name, t.timekeeper_name '
+        'HAVING COUNT(CASE WHEN m.is_flat_fees = \'Y\' THEN m.matter_id END) > 0 '
+        'ORDER BY flat_fee_matter_count DESC;',
+        "Generate a detailed report of clients with flat fee matters, including client names, billing attorneys, counts of flat fee and non-flat fee matters, total fees paid, and a breakdown of practice groups involved."
     ),
     (
-        'SELECT m."matter_name", '
-        'ROUND((SUM(CASE WHEN tc."is_nonbillable" = \'Y\' THEN tc."worked_hours" ELSE 0 END) / NULLIF(SUM(tc."worked_hours"), 0) * 100)::numeric, 2) AS non_billable_percent '
-        'FROM "timecard" tc '
-        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
-        'WHERE EXTRACT(YEAR FROM tc."date") = 2025 '
-        'AND tc."is_active" = \'Y\' '
-        'AND m."is_active" = \'Y\' '
-        'GROUP BY m."matter_name" '
-        'HAVING SUM(CASE WHEN tc."is_nonbillable" = \'Y\' THEN tc."worked_hours" ELSE 0 END) / NULLIF(SUM(tc."worked_hours"), 0) > 0.25 '
-        'ORDER BY non_billable_percent DESC;',
-        "Which matters have more than 25% non-billable hours in 2025?"
-    ),
-    (
-        'SELECT c."client_name", COUNT(DISTINCT tc."timecard_id") AS error_timecards '
-        'FROM "timecard" tc '
-        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
-        'JOIN "client" c ON m."client_id" = c."client_id" '
-        'WHERE tc."worked_amount" > tc."standard_amount" '
-        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
-        'AND tc."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
-        'GROUP BY c."client_name" '
-        'ORDER BY error_timecards DESC;',
-        "Which clients have timecards with worked amounts exceeding standard amounts in 2025?"
-    ),
-    (
-        'SELECT t."timekeeper_name", ROUND(AVG(mts."standard_amount" - mts."worked_amount")::numeric, 2) AS avg_underbilling '
-        'FROM "matter_timekeeper_summary" mts '
-        'JOIN "timekeeper" t ON mts."timekeeper_id" = t."timekeeper_id" '
-        'WHERE mts."year" = 2025 '
-        'AND mts."is_error" = \'N\' '
-        'AND t."is_active" = \'Y\' '
-        'GROUP BY t."timekeeper_name" '
-        'ORDER BY avg_underbilling DESC '
-        'LIMIT 5;',
-        "Which timekeepers have the highest average underbilling amount per matter in 2025?"
-    ),
-    (
-        'SELECT m."matter_name", ROUND(AVG(rd."deviation_percent" * 100)::numeric, 2) AS avg_discount_percent '
-        'FROM "rate_detail" rd '
-        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
-        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
-        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
-        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
-        'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'GROUP BY m."matter_name" '
-        'HAVING AVG(rd."deviation_percent" * 100) > 15 '
-        'ORDER BY avg_discount_percent DESC;',
-        "Which matters have an average discount percentage above 15% in 2025?"
-    ),
-    (
-        'SELECT t."type" AS timekeeper_type, ROUND(SUM(tc."worked_hours")::numeric, 2) AS non_billable_hours '
-        'FROM "timecard" tc '
-        'JOIN "timekeeper" t ON tc."timekeeper_id" = t."timekeeper_id" '
-        'WHERE tc."is_nonbillable" = \'Y\' '
-        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
-        'AND tc."is_active" = \'Y\' '
-        'AND t."is_active" = \'Y\' '
-        'GROUP BY t."type" '
-        'ORDER BY non_billable_hours DESC;',
-        "Which timekeeper types have the most non-billable hours in 2025?"
-    ),
-    (
-        'SELECT m."matter_name", COUNT(tc."timecard_id") AS currency_mismatch '
-        'FROM "timecard" tc '
-        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
-        'WHERE tc."worked_currency" != m."matter_currency" '
-        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
-        'AND tc."is_active" = \'Y\' '
-        'AND m."is_active" = \'Y\' '
-        'GROUP BY m."matter_name" '
-        'ORDER BY currency_mismatch DESC;',
-        "Which matters have timecards with currency mismatches in 2025?"
-    ),
-    (
-        'SELECT c."client_name", ROUND(SUM(tc."worked_hours")::numeric, 2) AS no_charge_hours '
-        'FROM "timecard" tc '
-        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
-        'JOIN "client" c ON m."client_id" = c."client_id" '
-        'WHERE tc."is_no_charge" = \'Y\' '
-        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
-        'AND tc."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
-        'GROUP BY c."client_name" '
-        'ORDER BY no_charge_hours DESC '
-        'LIMIT 5;',
-        "Which clients have the most no-charge hours across their matters in 2025?"
-    ),
-    (
-        'SELECT t."timekeeper_name", '
-        'ROUND(SUM(mts."standard_amount" - mts."worked_amount") / NULLIF(SUM(mts."worked_hours"), 0)::numeric, 2) AS underbilling_per_hour '
-        'FROM "matter_timekeeper_summary" mts '
-        'JOIN "timekeeper" t ON mts."timekeeper_id" = t."timekeeper_id" '
-        'WHERE mts."year" = 2025 '
-        'AND mts."is_error" = \'N\' '
-        'AND t."is_active" = \'Y\' '
-        'GROUP BY t."timekeeper_name" '
-        'ORDER BY underbilling_per_hour DESC '
-        'LIMIT 5;',
-        "Which timekeepers have the highest underbilling amount per hour in 2025?"
-    ),
-    (
-        'SELECT m."matter_name", COUNT(DISTINCT mts."tk_mat_sum_id") AS underbilled_entries '
-        'FROM "matter_timekeeper_summary" mts '
-        'JOIN "matter" m ON mts."matter_id" = m."matter_id" '
-        'WHERE mts."worked_amount" < mts."standard_amount" '
-        'AND mts."year" = 2025 '
-        'AND mts."is_error" = \'N\' '
-        'AND m."is_active" = \'Y\' '
-        'GROUP BY m."matter_name" '
-        'ORDER BY underbilled_entries DESC '
-        'LIMIT 5;',
-        "Which matters have the most underbilled entries in 2025?"
-    ),
-    (
-        'SELECT t."timekeeper_name", '
-        'ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY (tc."worked_rate" / NULLIF(tc."standard_rate", 0)))::numeric, 2) AS median_rate_ratio '
-        'FROM "timecard" tc '
-        'JOIN "timekeeper" t ON tc."timekeeper_id" = t."timekeeper_id" '
-        'WHERE EXTRACT(YEAR FROM tc."date") = 2025 '
-        'AND tc."is_active" = \'Y\' '
-        'AND tc."is_nonbillable" = \'N\' '
-        'AND t."is_active" = \'Y\' '
-        'GROUP BY t."timekeeper_name" '
-        'HAVING PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY (tc."worked_rate" / NULLIF(tc."standard_rate", 0))) < 0.9 '
-        'ORDER BY median_rate_ratio ASC;',
-        "Which timekeepers have a median worked-to-standard rate ratio below 90% in 2025?"
-    ),
-    (
-        'SELECT m."category", ROUND(AVG(mts."standard_amount" - mts."worked_amount")::numeric, 2) AS avg_underbilling '
-        'FROM "matter_timekeeper_summary" mts '
-        'JOIN "matter" m ON mts."matter_id" = m."matter_id" '
-        'WHERE mts."year" = 2025 '
-        'AND mts."is_error" = \'N\' '
-        'AND m."is_active" = \'Y\' '
-        'GROUP BY m."category" '
-        'ORDER BY avg_underbilling DESC;',
-        "Which matter categories have the highest average underbilling in 2025?"
-    ),
-    (
-        'SELECT c."client_name", '
-        'ROUND((SUM(CASE WHEN tc."is_nonbillable" = \'Y\' OR tc."is_no_charge" = \'Y\' THEN tc."worked_hours" ELSE 0 END) / NULLIF(SUM(tc."worked_hours"), 0) * 100)::numeric, 2) AS non_billed_percent '
-        'FROM "timecard" tc '
-        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
-        'JOIN "client" c ON m."client_id" = c."client_id" '
-        'WHERE EXTRACT(YEAR FROM tc."date") = 2025 '
-        'AND tc."is_active" = \'Y\' '
-        'AND c."is_active" = \'Y\' '
-        'GROUP BY c."client_name" '
-        'HAVING SUM(CASE WHEN tc."is_nonbillable" = \'Y\' OR tc."is_no_charge" = \'Y\' THEN tc."worked_hours" ELSE 0 END) / NULLIF(SUM(tc."worked_hours"), 0) > 0.2 '
-        'ORDER BY non_billed_percent DESC;',
-        "Which clients have more than 20% of their hours as non-billable or no-charge in 2025?"
-    ),
-    (
-        'SELECT m."matter_name", '
-        'ROUND(SUM(CASE WHEN tc."worked_amount" < tc."standard_amount" THEN (tc."standard_amount" - tc."worked_amount") ELSE 0 END)::numeric, 2) AS underbilling_amount '
-        'FROM "timecard" tc '
-        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
-        'WHERE EXTRACT(YEAR FROM tc."date") = 2025 '
-        'AND tc."is_active" = \'Y\' '
-        'AND m."is_active" = \'Y\' '
-        'AND tc."is_nonbillable" = \'N\' '
-        'AND tc."is_no_charge" = \'N\' '
-        'GROUP BY m."matter_name" '
-        'ORDER BY underbilling_amount DESC '
-        'LIMIT 5;',
-        "Which matters have the highest underbilling amount for billable timecards in 2025?"
-    ),
-    # New Queries to Address Drawbacks
-    (
-        'SELECT EXTRACT(MONTH FROM tc."date") AS month, ROUND(SUM(tc."standard_amount" - tc."worked_amount")::numeric, 2) AS monthly_underbilling '
-        'FROM "timecard" tc '
-        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
-        'WHERE EXTRACT(YEAR FROM tc."date") = 2025 '
-        'AND tc."is_active" = \'Y\' '
-        'AND m."is_active" = \'Y\' '
-        'AND tc."is_nonbillable" = \'N\' '
-        'AND tc."is_no_charge" = \'N\' '
-        'GROUP BY EXTRACT(MONTH FROM tc."date") '
+        'SELECT DATE_TRUNC(\'month\', m.open_date) AS month, '
+        'COUNT(m.matter_id) AS flat_fee_matter_count, '
+        'COUNT(m.matter_id) - LAG(COUNT(m.matter_id)) OVER (ORDER BY DATE_TRUNC(\'month\', m.open_date)) AS change_from_previous, '
+        'ROUND((COUNT(m.matter_id) - LAG(COUNT(m.matter_id)) OVER (ORDER BY DATE_TRUNC(\'month\', m.open_date))) / '
+        'NULLIF(LAG(COUNT(m.matter_id)) OVER (ORDER BY DATE_TRUNC(\'month\', m.open_date)), 0)::numeric * 100, 2) AS percent_change '
+        'FROM matter m '
+        'WHERE m.is_flat_fees = \'Y\' '
+        'AND m.open_date >= CURRENT_DATE - INTERVAL \'2 years\' '
+        'GROUP BY DATE_TRUNC(\'month\', m.open_date) '
         'ORDER BY month;',
-        "What is the monthly breakdown of underbilling amounts for billable timecards in 2025?"
+        "Analyze the trend of flat fee matters opened over the past two years, including monthly counts, changes from the previous month, percentage changes, and any significant increases or decreases in the data."
+    ),
+    # Productivity Analysis Category
+    (
+        'SELECT md.office, md.department, md.practice_group, DATE_TRUNC(\'month\', tc.date) AS month, '
+        'SUM(tc.worked_hours) AS total_hours, '
+        'SUM(CASE WHEN EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) - 1 THEN tc.worked_hours ELSE 0 END) AS prev_year_hours, '
+        'ROUND((SUM(tc.worked_hours) - SUM(CASE WHEN EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) - 1 THEN tc.worked_hours ELSE 0 END)) / '
+        'NULLIF(SUM(CASE WHEN EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) - 1 THEN tc.worked_hours ELSE 0 END), 0)::numeric * 100, 2) AS yoy_change '
+        'FROM timecard tc '
+        'JOIN matter m ON tc.matter_id = m.matter_id '
+        'JOIN matter_date md ON m.matter_id = md.matter_id '
+        'WHERE EXTRACT(YEAR FROM tc.date) IN (EXTRACT(YEAR FROM CURRENT_DATE), EXTRACT(YEAR FROM CURRENT_DATE) - 1) '
+        'AND md.end_date IS NULL '
+        'GROUP BY md.office, md.department, md.practice_group, DATE_TRUNC(\'month\', tc.date) '
+        'ORDER BY md.office, month;',
+        "Conduct a detailed analysis of hours worked year-to-date, grouped by office, department, and practice group, including monthly totals, comparisons with the previous year, and percentage changes to identify trends."
     ),
     (
-        'SELECT m."matter_name", SUM(tc."worked_hours") AS total_hours '
-        'FROM "timecard" tc '
-        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
-        'WHERE m."is_flat_fees" = \'Y\' '
-        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
-        'AND tc."is_active" = \'Y\' '
-        'AND m."is_active" = \'Y\' '
-        'GROUP BY m."matter_name" '
-        'HAVING SUM(tc."worked_hours") > 100 '
+        'SELECT c.client_id, c.client_name, t.timekeeper_name AS relationship_manager, '
+        'COUNT(DISTINCT m.matter_id) AS matter_count, SUM(tc.worked_hours) AS total_hours, '
+        'STRING_AGG(DISTINCT md.practice_group, \', \') AS practice_groups '
+        'FROM timecard tc '
+        'JOIN matter m ON tc.matter_id = m.matter_id '
+        'JOIN client c ON m.client_id = c.client_id '
+        'JOIN timekeeper t ON c.relationship_timekeeper_id = t.timekeeper_id '
+        'JOIN matter_date md ON m.matter_id = md.matter_id '
+        'WHERE EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) '
+        'AND md.end_date IS NULL '
+        'GROUP BY c.client_id, c.client_name, t.timekeeper_name '
         'ORDER BY total_hours DESC '
-        'LIMIT 5;',
-        "Which flat-fee matters have more than 100 hours worked in 2025?"
+        'LIMIT 10;',
+        "Identify the top 10 clients with the most hours worked year-to-date, including client names, relationship managers, matter counts, total hours, and a breakdown of practice groups involved."
     ),
     (
-        'SELECT m."matter_name", COUNT(tc."timecard_id") AS null_rate_timecards '
-        'FROM "timecard" tc '
-        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
-        'WHERE (tc."worked_rate" IS NULL OR tc."standard_rate" IS NULL) '
-        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
-        'AND tc."is_active" = \'Y\' '
-        'AND m."is_active" = \'Y\' '
-        'GROUP BY m."matter_name" '
-        'ORDER BY null_rate_timecards DESC;',
-        "Which matters have timecards with missing worked or standard rates in 2025?"
+        'SELECT DATE_TRUNC(\'month\', tc.date) AS month, SUM(tc.worked_hours) AS total_hours, '
+        'SUM(CASE WHEN EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) - 1 THEN tc.worked_hours ELSE 0 END) AS prev_year_hours, '
+        'ROUND((SUM(tc.worked_hours) - SUM(CASE WHEN EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) - 1 THEN tc.worked_hours ELSE 0 END)) / '
+        'NULLIF(SUM(CASE WHEN EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) - 1 THEN tc.worked_hours ELSE 0 END), 0)::numeric * 100, 2) AS yoy_change '
+        'FROM timecard tc '
+        'JOIN matter m ON tc.matter_id = m.matter_id '
+        'JOIN client c ON m.client_id = c.client_id '
+        'WHERE c.client_name ILIKE \'%Apple%\' '
+        'AND EXTRACT(YEAR FROM tc.date) IN (EXTRACT(YEAR FROM CURRENT_DATE), EXTRACT(YEAR FROM CURRENT_DATE) - 1) '
+        'GROUP BY DATE_TRUNC(\'month\', tc.date) '
+        'ORDER BY month;',
+        "Analyze the year-to-date trend of hours worked for matters associated with clients containing 'Apple' in their name, including monthly totals, comparisons with the previous year, and percentage changes to identify trends or anomalies."
     ),
     (
-        'SELECT m."matter_name", COUNT(tc."timecard_id") AS currency_mismatch '
-        'FROM "timecard" tc '
-        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
-        'WHERE tc."standard_rate_currency" != m."matter_currency" '
-        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
-        'AND tc."is_active" = \'Y\' '
-        'AND m."is_active" = \'Y\' '
-        'GROUP BY m."matter_name" '
-        'ORDER BY currency_mismatch DESC;',
-        "Which matters have timecards with standard rate currency mismatches in 2025?"
+        'SELECT c.client_id, c.client_name, COUNT(DISTINCT m.matter_id) AS matter_count, '
+        'SUM(CASE WHEN EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) THEN tc.worked_hours ELSE 0 END) AS ytd_hours, '
+        'SUM(CASE WHEN EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) - 1 THEN tc.worked_hours ELSE 0 END) AS lytd_hours, '
+        'RANK() OVER (ORDER BY SUM(CASE WHEN EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) THEN tc.worked_hours ELSE 0 END) DESC) AS ytd_rank, '
+        'RANK() OVER (ORDER BY SUM(CASE WHEN EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) - 1 THEN tc.worked_hours ELSE 0 END) DESC) AS lytd_rank '
+        'FROM timecard tc '
+        'JOIN matter m ON tc.matter_id = m.matter_id '
+        'JOIN client c ON m.client_id = c.client_id '
+        'WHERE EXTRACT(YEAR FROM tc.date) IN (EXTRACT(YEAR FROM CURRENT_DATE), EXTRACT(YEAR FROM CURRENT_DATE) - 1) '
+        'GROUP BY c.client_id, c.client_name '
+        'ORDER BY ytd_hours DESC;',
+        "Provide a year-over-year analysis of client hours worked, including client names, matter counts, YTD and last YTD hours, and rankings for both years to highlight changes in client activity."
     ),
     (
-        'SELECT rd."arrangement", ROUND(AVG(rd."deviation_amount")::numeric, 2) AS avg_discount '
-        'FROM "rate_detail" rd '
-        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
-        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
-        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
-        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
-        'WHERE rd."start_date" <= \'2025-12-31\' '
-        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
-        'AND m."is_active" = \'Y\' '
-        'GROUP BY rd."arrangement" '
-        'ORDER BY avg_discount DESC;',
-        "Which rate arrangements have the highest average discount amounts in 2025?"
+        'SELECT c.client_id, c.client_name, DATE_TRUNC(\'month\', tc.date) AS month, '
+        'SUM(tc.worked_hours) AS total_hours, '
+        'STRING_AGG(DISTINCT md.practice_group, \', \') AS practice_groups '
+        'FROM timecard tc '
+        'JOIN matter m ON tc.matter_id = m.matter_id '
+        'JOIN client c ON m.client_id = c.client_id '
+        'JOIN matter_date md ON m.matter_id = md.matter_id '
+        'WHERE c.relationship_timekeeper_id = \'user_id\' '
+        'AND EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) '
+        'AND md.end_date IS NULL '
+        'GROUP BY c.client_id, c.client_name, DATE_TRUNC(\'month\', tc.date) '
+        'ORDER BY c.client_name, month;',
+        "Analyze the monthly hours worked for clients managed by the relationship manager, including client names, total hours, and practice groups involved, to identify trends in client activity."
+    ),
+    # Realization Category
+    (
+        'SELECT c.client_id, c.client_name, '
+        'ROUND((SUM(mts.worked_amount) / NULLIF(SUM(mts.standard_amount), 0) * 100)::numeric, 2) AS realization_rate, '
+        'SUM(mts.worked_amount) AS total_worked_amount, SUM(mts.standard_amount) AS total_standard_amount '
+        'FROM matter_timekeeper_summary mts '
+        'JOIN matter m ON mts.matter_id = m.matter_id '
+        'JOIN client c ON m.client_id = c.client_id '
+        'WHERE c.relationship_timekeeper_id = (SELECT timekeeper_id FROM timekeeper WHERE timekeeper_name = \'Lynn Bond\') '
+        'AND mts.year = EXTRACT(YEAR FROM CURRENT_DATE) '
+        'GROUP BY c.client_id, c.client_name '
+        'HAVING SUM(mts.worked_amount) / NULLIF(SUM(mts.standard_amount), 0) * 100 < 70 '
+        'ORDER BY realization_rate;',
+        "List all clients managed by Lynn with a realization rate below 70%, including client names, realization rates, total worked and standard amounts, to identify underperforming engagements."
     ),
     (
-        'SELECT t."timekeeper_name", '
-        'ROUND(SUM(tc."worked_hours" * t."cost_rate")::numeric, 2) AS total_cost '
-        'FROM "timecard" tc '
-        'JOIN "timekeeper" t ON tc."timekeeper_id" = t."timekeeper_id" '
-        'WHERE tc."is_nonbillable" = \'Y\' '
-        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
-        'AND tc."is_active" = \'Y\' '
-        'AND t."is_active" = \'Y\' '
-        'GROUP BY t."timekeeper_name" '
-        'ORDER BY total_cost DESC '
-        'LIMIT 5;',
-        "Which timekeepers have the highest cost for non-billable hours in 2025?"
+        'SELECT c.client_id, c.client_name, '
+        'ROUND((SUM(mts.worked_amount) / NULLIF(SUM(mts.standard_amount), 0) * 100)::numeric, 2) AS realization_rate, '
+        'SUM(mts.worked_amount) AS total_worked_amount, SUM(mts.standard_amount) AS total_standard_amount '
+        'FROM matter_timekeeper_summary mts '
+        'JOIN matter m ON mts.matter_id = m.matter_id '
+        'JOIN client c ON m.client_id = c.client_id '
+        'JOIN timekeeper t ON c.relationship_timekeeper_id = t.timekeeper_id '
+        'WHERE t.timekeeper_name = \'Lynn Bond\' '
+        'AND mts.year = EXTRACT(YEAR FROM CURRENT_DATE) '
+        'GROUP BY c.client_id, c.client_name '
+        'HAVING SUM(mts.worked_amount) / NULLIF(SUM(mts.standard_amount), 0) * 100 < 70 '
+        'ORDER BY realization_rate;',
+        "Provide a detailed report of clients managed by Lynn Bond with realization rates below 70%, including client names, realization rates, and total worked and standard amounts to assess billing efficiency."
     ),
     (
-        'SELECT c."type" AS client_type, ROUND(SUM(mts."standard_amount" - mts."worked_amount")::numeric, 2) AS total_underbilling '
-        'FROM "matter_timekeeper_summary" mts '
-        'JOIN "matter" m ON mts."matter_id" = m."matter_id" '
-        'JOIN "client" c ON m."client_id" = c."client_id" '
-        'WHERE mts."year" = 2025 '
-        'AND mts."is_error" = \'N\' '
-        'AND c."is_active" = \'Y\' '
-        'GROUP BY c."type" '
-        'ORDER BY total_underbilling DESC;',
-        "Which client types have the highest total underbilling in 2025?"
+        'SELECT c.client_id, c.client_name, '
+        'ROUND((SUM(mts.worked_amount) / NULLIF(SUM(mts.standard_amount), 0) * 100)::numeric, 2) AS realization_rate, '
+        'SUM(mts.worked_amount) AS total_worked_amount, SUM(mts.standard_amount) AS total_standard_amount '
+        'FROM matter_timekeeper_summary mts '
+        'JOIN matter m ON mts.matter_id = m.matter_id '
+        'JOIN client c ON m.client_id = c.client_id '
+        'WHERE mts.year = EXTRACT(YEAR FROM CURRENT_DATE) '
+        'GROUP BY c.client_id, c.client_name '
+        'HAVING SUM(mts.worked_amount) / NULLIF(SUM(mts.standard_amount), 0) * 100 > 200 '
+        'ORDER BY realization_rate DESC;',
+        "Identify clients with realization rates exceeding 200%, including client names, realization rates, and total worked and standard amounts, to investigate potential billing anomalies."
     ),
     (
-        'SELECT m."matter_name", '
-        'ROUND(STDDEV(tc."worked_rate" / NULLIF(tc."standard_rate", 0))::numeric, 2) AS rate_ratio_stddev '
-        'FROM "timecard" tc '
-        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
-        'WHERE EXTRACT(YEAR FROM tc."date") = 2025 '
-        'AND tc."is_active" = \'Y\' '
-        'AND m."is_active" = \'Y\' '
-        'AND tc."is_nonbillable" = \'N\' '
-        'GROUP BY m."matter_name" '
-        'HAVING STDDEV(tc."worked_rate" / NULLIF(tc."standard_rate", 0)) > 0.1 '
-        'ORDER BY rate_ratio_stddev DESC '
-        'LIMIT 5;',
-        "Which matters have the highest variability in worked-to-standard rate ratios in 2025?"
+        'SELECT c.client_id, c.client_name, '
+        'ROUND((SUM(mts.standard_amount - mts.worked_amount))::numeric, 2) AS total_gap, '
+        'SUM(mts.worked_amount) AS worked_amount, SUM(mts.standard_amount) AS standard_amount, '
+        'ROUND((SUM(mts.worked_amount) / NULLIF(SUM(mts.standard_amount), 0) * 100)::numeric, 2) AS realization_rate '
+        'FROM matter_timekeeper_summary mts '
+        'JOIN matter m ON mts.matter_id = m.matter_id '
+        'JOIN client c ON m.client_id = c.client_id '
+        'WHERE mts.year = EXTRACT(YEAR FROM CURRENT_DATE) '
+        'GROUP BY c.client_id, c.client_name '
+        'ORDER BY total_gap DESC '
+        'LIMIT 10;',
+        "List the top 10 clients with the widest gap between standard and billed rates, including client names, total gaps, worked and standard amounts, and realization rates, to prioritize billing reviews."
+    ),
+    # E-billed Category
+    (
+        'SELECT c.client_id, c.client_name, t.timekeeper_name AS relationship_manager, '
+        'COUNT(DISTINCT m.billing_timekeeper_id) AS billing_attorney_count, '
+        'COUNT(DISTINCT m.matter_id) AS matter_count, COALESCE(SUM(mts.worked_hours), 0) AS total_hours, '
+        'STRING_AGG(DISTINCT md.practice_group, \', \') AS practice_groups '
+        'FROM client c '
+        'JOIN matter m ON c.client_id = m.client_id '
+        'JOIN timekeeper t ON c.relationship_timekeeper_id = t.timekeeper_id '
+        'JOIN matter_date md ON m.matter_id = md.matter_id '
+        'LEFT JOIN matter_timekeeper_summary mts ON m.matter_id = mts.matter_id '
+        'WHERE c.is_ebilled = \'Y\' '
+        'AND c.is_active = \'Y\' '
+        'AND md.end_date IS NULL '
+        'AND mts.year = EXTRACT(YEAR FROM CURRENT_DATE) '
+        'GROUP BY c.client_id, c.client_name, t.timekeeper_name '
+        'ORDER BY matter_count DESC;',
+        "Compile a detailed report of e-billed clients, including client names, relationship managers, number of billing attorneys, matter counts, total hours worked, and practice groups involved."
     ),
     (
-        'SELECT t."timekeeper_name", '
-        'ROUND(SUM(CASE WHEN tc."worked_amount" < tc."standard_amount" THEN (tc."standard_amount" - tc."worked_amount") ELSE 0 END)::numeric, 2) AS underbilling_2025, '
-        'ROUND(LAG(SUM(CASE WHEN tc."worked_amount" < tc."standard_amount" THEN (tc."standard_amount" - tc."worked_amount") ELSE 0 END)) OVER (PARTITION BY t."timekeeper_name" ORDER BY EXTRACT(YEAR FROM tc."date"))::numeric, 2) AS underbilling_2024 '
-        'FROM "timecard" tc '
-        'JOIN "timekeeper" t ON tc."timekeeper_id" = t."timekeeper_id" '
-        'WHERE EXTRACT(YEAR FROM tc."date") IN (2024, 2025) '
-        'AND tc."is_active" = \'Y\' '
-        'AND t."is_active" = \'Y\' '
-        'AND tc."is_nonbillable" = \'N\' '
-        'AND tc."is_no_charge" = \'N\' '
-        'GROUP BY t."timekeeper_name", EXTRACT(YEAR FROM tc."date") '
-        'HAVING EXTRACT(YEAR FROM tc."date") = 2025 '
-        'ORDER BY underbilling_2025 DESC '
-        'LIMIT 5;',
-        "Which timekeepers have the highest underbilling in 2025 compared to 2024?"
+        'SELECT c.client_id, c.client_name, DATE_TRUNC(\'month\', tc.date) AS month, '
+        'COUNT(DISTINCT m.matter_id) AS matter_count, SUM(tc.worked_hours) AS total_hours, '
+        'STRING_AGG(DISTINCT md.practice_group, \', \') AS practice_groups '
+        'FROM timecard tc '
+        'JOIN matter m ON tc.matter_id = m.matter_id '
+        'JOIN client c ON m.client_id = c.client_id '
+        'JOIN matter_date md ON m.matter_id = md.matter_id '
+        'WHERE c.relationship_timekeeper_id = \'user_id\' '
+        'AND c.is_ebilled = \'Y\' '
+        'AND EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) '
+        'AND md.end_date IS NULL '
+        'GROUP BY c.client_id, c.client_name, DATE_TRUNC(\'month\', tc.date) '
+        'ORDER BY c.client_name, month;',
+        "Analyze the monthly trend of hours worked for e-billed clients managed by the relationship manager, including client names, matter counts, total hours, and practice groups, to track billing activity."
+    ),
+    # Rate Review Category
+    (
+        'SELECT c.client_id, c.client_name, t.timekeeper_name AS relationship_manager, '
+        'c.last_review_date, c.rate_review_date, c.notification_days, '
+        'COUNT(DISTINCT m.matter_id) AS matter_count, COUNT(DISTINCT rs.rate_set_id) AS rate_set_count, '
+        'STRING_AGG(DISTINCT rs.rate_set_code, \', \') AS rate_set_codes '
+        'FROM client c '
+        'JOIN timekeeper t ON c.relationship_timekeeper_id = t.timekeeper_id '
+        'LEFT JOIN matter m ON c.client_id = m.client_id AND m.is_active = \'Y\' '
+        'LEFT JOIN rate_set rs ON m.rate_set_id = rs.rate_set_id '
+        'WHERE (c.last_review_date IS NULL OR c.last_review_date < CURRENT_DATE - INTERVAL \'1 year\' - c.notification_days * INTERVAL \'1 day\') '
+        'AND c.is_active = \'Y\' '
+        'GROUP BY c.client_id, c.client_name, t.timekeeper_name, c.last_review_date, c.rate_review_date, c.notification_days '
+        'ORDER BY c.client_name;',
+        "List all clients that have not had their rates reviewed, including client names, relationship managers, last review dates, rate review dates, notification days, matter counts, rate set counts, and rate set codes."
     ),
     (
-        'SELECT m."matter_name", COUNT(DISTINCT rd."rate_detail_id") AS missing_rate_details '
-        'FROM "matter" m '
-        'LEFT JOIN "rate_set" rs ON m."rate_set_id" = rs."rate_set_id" '
-        'LEFT JOIN "rate_set_link" rsl ON rs."rate_set_id" = rsl."rate_set_id" '
-        'LEFT JOIN "rate_detail" rd ON rsl."rate_component_id" = rd."rate_component_id" '
-        'WHERE EXTRACT(YEAR FROM rd."start_date") = 2025 '
-        'AND m."is_active" = \'Y\' '
-        'AND rd."rate_detail_id" IS NULL '
-        'GROUP BY m."matter_name" '
-        'ORDER BY missing_rate_details DESC '
-        'LIMIT 5;',
-        "Which matters lack corresponding rate details in 2025?"
+        'SELECT c.client_id, c.client_name, t.timekeeper_name AS relationship_manager, '
+        'c.last_review_date, rs.rate_set_code, '
+        'COUNT(DISTINCT m.matter_id) AS matter_count, '
+        'COUNT(DISTINCT CASE WHEN rsl.rate_type <> \'GR\' THEN m.matter_id END) AS exception_rate_matter_count '
+        'FROM client c '
+        'JOIN timekeeper t ON c.relationship_timekeeper_id = t.timekeeper_id '
+        'JOIN matter m ON c.client_id = m.client_id '
+        'JOIN rate_set rs ON m.rate_set_id = rs.rate_set_id '
+        'JOIN rate_set_link rsl ON rs.rate_set_id = rsl.rate_set_id '
+        'WHERE rsl.rate_type <> \'GR\' '
+        'AND (c.last_review_date IS NULL OR c.last_review_date < CURRENT_DATE - INTERVAL \'1 year\') '
+        'AND c.is_active = \'Y\' '
+        'AND m.is_active = \'Y\' '
+        'GROUP BY c.client_id, c.client_name, t.timekeeper_name, c.last_review_date, rs.rate_set_code '
+        'ORDER BY matter_count DESC;',
+        "Provide a detailed report of clients with exception rates that have not been reviewed in the last year, including client names, relationship managers, last review dates, rate set codes, total matter counts, and counts of matters with exception rates."
+    ),
+    # Utilization and Budget Category
+    (
+        'SELECT t.timekeeper_id, t.timekeeper_name, tkd.title, tkd.office, '
+        'SUM(CASE WHEN tc.date >= DATE_TRUNC(\'month\', CURRENT_DATE - INTERVAL \'1 month\') THEN tc.worked_hours ELSE 0 END) AS last_month_hours, '
+        'ROUND((SUM(CASE WHEN tc.date >= DATE_TRUNC(\'month\', CURRENT_DATE - INTERVAL \'1 month\') THEN tc.worked_hours ELSE 0 END) / NULLIF(t.budget_hours / 12, 0) * 100)::numeric, 2) AS last_month_utilization, '
+        'SUM(tc.worked_hours) AS ytd_hours, '
+        'ROUND((SUM(tc.worked_hours) / NULLIF(t.budget_hours, 0) * 100)::numeric, 2) AS ytd_utilization '
+        'FROM timekeeper t '
+        'JOIN timekeeper_date tkd ON t.timekeeper_id = tkd.timekeeper_id '
+        'JOIN timecard tc ON t.timekeeper_id = tc.timekeeper_id '
+        'WHERE EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) '
+        'AND t.is_active = \'Y\' '
+        'AND tkd.end_date IS NULL '
+        'AND tc.is_nonbillable = \'N\' '
+        'GROUP BY t.timekeeper_id, t.timekeeper_name, tkd.title, tkd.office, t.budget_hours '
+        'HAVING (SUM(CASE WHEN tc.date >= DATE_TRUNC(\'month\', CURRENT_DATE - INTERVAL \'1 month\') THEN tc.worked_hours ELSE 0 END) / NULLIF(t.budget_hours / 12, 0) * 100) < 80 '
+        'ORDER BY last_month_utilization;',
+        "Identify timekeepers with low utilization rates (below 80%) in the last month, including their names, titles, offices, last month and YTD hours, and utilization percentages, to assess resource allocation."
+    ),
+    (
+        'SELECT DATE_TRUNC(\'month\', tc.date) AS month, SUM(tc.worked_hours) AS total_hours, '
+        't.budget_hours / 12 AS monthly_budget_hours, '
+        'ROUND((SUM(tc.worked_hours) / NULLIF(t.budget_hours / 12, 0) * 100)::numeric, 2) AS utilization_percent '
+        'FROM timecard tc '
+        'JOIN timekeeper t ON tc.timekeeper_id = t.timekeeper_id '
+        'WHERE tc.timekeeper_id = \'user_id\' '
+        'AND tc.is_active = \'Y\' '
+        'AND EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) '
+        'GROUP BY DATE_TRUNC(\'month\', tc.date), t.budget_hours '
+        'ORDER BY month;',
+        "Analyze the monthly utilization trend for the current user, including total hours worked, monthly budget hours, and utilization percentages, to compare actual performance against budget."
+    ),
+     # Timecard Analysis Category
+    (
+        'SELECT t.timekeeper_name, tkd.title, tkd.office, '
+        'ROUND(AVG((tc.posted_date - tc.date))::numeric, 2) AS avg_days_late, '
+        'COUNT(CASE WHEN tc.posted_date - tc.date > 5 THEN tc.timecard_id END) AS late_timecards, '
+        'ROUND((COUNT(CASE WHEN tc.posted_date - tc.date > 5 THEN tc.timecard_id END)::numeric / NULLIF(COUNT(tc.timecard_id), 0)) * 100, 2) AS late_percentage '
+        'FROM timecard tc '
+        'JOIN timekeeper t ON tc.timekeeper_id = t.timekeeper_id '
+        'JOIN timekeeper_date tkd ON t.timekeeper_id = tkd.timekeeper_id '
+        'WHERE EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) '
+        'AND tc.is_active = \'Y\' '
+        'AND tkd.end_date IS NULL '
+        'GROUP BY t.timekeeper_name, tkd.title, tkd.office '
+        'HAVING COUNT(CASE WHEN tc.posted_date - tc.date > 5 THEN tc.timecard_id END) > 0 '
+        'ORDER BY avg_days_late DESC;',
+        "Identify timekeepers who regularly enter timecards more than 5 days late, including their names, titles, offices, average days late, number of late timecards, and percentage of late entries, to improve time entry compliance."
+    ),
+    (
+        'SELECT t.timekeeper_name, tkd.title, '
+        'SUM(CASE WHEN tc.is_nonbillable = \'Y\' AND tc.date >= DATE_TRUNC(\'month\', CURRENT_DATE - INTERVAL \'1 month\') THEN tc.worked_hours ELSE 0 END) AS non_billable_hours_mtd, '
+        'SUM(CASE WHEN tc.is_nonbillable = \'N\' AND tc.date >= DATE_TRUNC(\'month\', CURRENT_DATE - INTERVAL \'1 month\') THEN tc.worked_hours ELSE 0 END) AS billable_hours_mtd, '
+        'SUM(CASE WHEN tc.is_nonbillable = \'Y\' AND EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) THEN tc.worked_hours ELSE 0 END) AS non_billable_hours_ytd, '
+        'SUM(CASE WHEN tc.is_nonbillable = \'N\' AND EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) THEN tc.worked_hours ELSE 0 END) AS billable_hours_ytd, '
+        'ROUND(SUM(CASE WHEN tc.is_nonbillable = \'Y\' THEN tc.worked_hours ELSE 0 END)::numeric / NULLIF(SUM(tc.worked_hours), 0) * 100, 2) AS non_billable_percentage '
+        'FROM timecard tc '
+        'JOIN timekeeper t ON tc.timekeeper_id = t.timekeeper_id '
+        'JOIN timekeeper_date tkd ON t.timekeeper_id = tkd.timekeeper_id '
+        'WHERE t.type = \'Litigation\' '
+        'AND tc.is_active = \'Y\' '
+        'AND tkd.end_date IS NULL '
+        'GROUP BY t.timekeeper_name, tkd.title '
+        'ORDER BY non_billable_hours_ytd DESC;',
+        "Analyze the non-billable versus billable hours split for the litigation team, including timekeeper names, titles, monthly and YTD hours for both categories, and the percentage of non-billable hours, to optimize resource allocation."
+    ),
+    # Matter Load Category
+    (
+        'SELECT t.timekeeper_id, t.timekeeper_name, tkd.title, tkd.office, '
+        'DATE_TRUNC(\'month\', tc.date) AS month, '
+        'SUM(CASE WHEN EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) THEN tc.worked_hours ELSE 0 END) AS current_year_hours, '
+        'SUM(CASE WHEN EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) - 1 THEN tc.worked_hours ELSE 0 END) AS prev_year_hours, '
+        'ROUND((SUM(CASE WHEN EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) THEN tc.worked_hours ELSE 0 END) - '
+        'SUM(CASE WHEN EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) - 1 THEN tc.worked_hours ELSE 0 END)) / '
+        'NULLIF(SUM(CASE WHEN EXTRACT(YEAR FROM tc.date) = EXTRACT(YEAR FROM CURRENT_DATE) - 1 THEN tc.worked_hours ELSE 0 END), 0)::numeric * 100, 2) AS yoy_change '
+        'FROM timecard tc '
+        'JOIN timekeeper t ON tc.timekeeper_id = t.timekeeper_id '
+        'JOIN timekeeper_date tkd ON t.timekeeper_id = tkd.timekeeper_id '
+        'WHERE tkd.title = \'Paralegal\' '
+        'AND tkd.office = \'New York\' '
+        'AND EXTRACT(YEAR FROM tc.date) IN (EXTRACT(YEAR FROM CURRENT_DATE), EXTRACT(YEAR FROM CURRENT_DATE) - 1) '
+        'AND t.is_active = \'Y\' '
+        'AND tkd.end_date IS NULL '
+        'GROUP BY t.timekeeper_id, t.timekeeper_name, tkd.title, tkd.office, DATE_TRUNC(\'month\', tc.date) '
+        'ORDER BY month, yoy_change DESC;',
+        "Analyze and display the trend of collected hours for Paralegals based in New York. Include a comparison with the previous year's data, identify any significant increases or decreases, and provide possible reasons for these changes. Also, highlight any patterns or anomalies in the data."
     )
 ]
 
-underbilling_documentation = [
-    "Underbilling occurs when the billed amount (worked_amount) is less than the expected amount (standard_amount) in timecard or matter_timekeeper_summary, due to lower rates, discounts, non-billable hours, no-charge entries, or flat-fee arrangements.",
-    "In the timecard table, worked_amount is calculated using worked_rate, while standard_amount uses standard_rate. A worked_amount lower than standard_amount indicates underbilling.",
-    "The is_nonbillable = 'Y' flag in timecard marks hours that are not billed, contributing to underbilling by reducing revenue.",
-    "The is_no_charge = 'Y' flag in timecard indicates hours worked but not charged to the client, a direct form of underbilling.",
-    "In rate_detail, deviation_amount and deviation_percent quantify discounts applied to rates, reducing worked_amount and causing underbilling.",
-    "The matter_timekeeper_summary table aggregates worked_amount and standard_amount by timekeeper and matter, useful for calculating total or average underbilling.",
-    "The timekeeper table’s type column (e.g., Partner, Associate) helps analyze underbilling trends by role.",
-    "The matter table’s type and category columns categorize matters (e.g., Litigation, Corporate), enabling underbilling analysis by matter characteristics.",
-    "The client table’s client_name links to matters, allowing identification of clients with high underbilling.",
-    "Comparing worked_rate to standard_rate in timecard reveals rate reductions that lead to underbilling.",
-    "Data errors, such as worked_amount exceeding standard_amount or null worked_rate in timecard, can mask or cause underbilling and require investigation.",
-    "The rate_set, rate_set_link, and rate_component tables connect matters to rate structures, with rate_detail providing discount details via deviation_amount.",
-    "Realization rate (worked_amount / standard_amount * 100 or worked_rate / standard_rate * 100) in matter_timekeeper_summary or timecard indicates underbilling when below 100%.",
-    "Currency mismatches between worked_currency or standard_rate_currency in timecard and matter_currency in matter may cause billing errors, potentially leading to underbilling.",
-    "The is_active = 'Y' flag in timecard, matter, and client ensures analysis focuses on current, relevant data.",
-    "The is_error = 'N' flag in matter_timekeeper_summary filters out erroneous entries to ensure accurate underbilling calculations.",
-    "The is_flat_fees = 'Y' flag in matter or is_flat_fee = 'Y' in timecard indicates fixed-fee arrangements, where underbilling occurs if hours worked exceed expected value.",
-    "The timekeeper table’s cost_rate and cost_rate_currency allow cost-based underbilling analysis, e.g., non-billable hours’ financial impact.",
-    "The client table’s type column (e.g., Corporate, Individual) enables underbilling analysis by client characteristics.",
-    "The rate_detail table’s arrangement column categorizes billing arrangements, useful for analyzing discount patterns.",
-    "Statistical measures like standard deviation of worked_rate / standard_rate in timecard reveal variability in billing practices.",
-    "Year-over-year comparisons using timecard or matter_timekeeper_summary data identify trends in underbilling.",
-    "Missing rate_detail entries for matters indicate potential billing configuration errors, leading to underbilling."
+# Documentation for the General Query Assistant
+# This file provides detailed guidance for the general_query_agent to handle natural-language queries
+# within a RAG pipeline, using the rate model schema as of June 17, 2025.
+
+general_query_documentation = [
+    # Purpose and Scope
+    "The General Query Assistant retrieves and analyzes data from the rate model schema, covering clients, matters, timekeepers, and billing information, to support queries in categories like Lists, Flat Fees, Productivity Analysis, Realization, E-billed, Rate Review, Utilization and Budget, Timecard Analysis, and Matter Load.",
+    "The assistant processes natural-language questions, maps them to PostgreSQL queries, and delivers concise, actionable responses optimized for a Retrieval-Augmented Generation (RAG) pipeline.",
+
+    # Query Processing Rules
+    "Natural-language queries are parsed to identify entities (e.g., ‘clients’, ‘Lynn Bond’, ‘Retail’) and intents (e.g., list, trend, analyze), using training data question-SQL pairs as reference.",
+    "The term ‘my’ refers to the user’s context (e.g., relationship_timekeeper_id for clients, billing_timekeeper_id for matters), validated against the user’s timekeeper_id.",
+    "Names (e.g., ‘Lynn Bond’, ‘Pepsi’) are matched case-insensitively using ILIKE on fields like timekeeper_name or client_name, prompting clarification if multiple matches occur.",
+    "Ambiguous terms (e.g., ‘Retail’) are searched across relevant fields (e.g., client_name, client.category, matter.type, matter_date.practice_group), noting the matched field in responses.",
+    "Placeholders like ‘user_id’ are replaced with the authenticated user’s timekeeper_id, ensuring queries respect user permissions.",
+    "Date-based filters use the current date (June 17, 2025) for calculations (e.g., YTD = 2025, last 21 days = CURRENT_DATE - INTERVAL ‘21 days’).",
+    "Historical comparisons (e.g., year-over-year) include prior years’ data (e.g., 2024 for LYTD) using EXTRACT(YEAR FROM date).",
+    "Active records are filtered with is_active = ‘Y’ in client, matter, and timecard tables, and end_date IS NULL in matter_date and timekeeper_date.",
+
+    # Analytical Capabilities
+    "Realization rate is calculated as (worked_amount / standard_amount * 100) in matter_timekeeper_summary or (worked_rate / standard_rate * 100) in timecard, indicating billing efficiency when below 100%.",
+    "Utilization rate is computed as (worked_hours / budget_hours * 100) in timecard or matter_timekeeper_summary, assessing timekeeper productivity against targets.",
+    "Year-over-year trends are analyzed using LAG or direct comparisons of aggregated metrics (e.g., worked_hours, worked_amount) by year or month.",
+    "Month-over-month trends use DATE_TRUNC(‘month’, date) to aggregate data, calculating percentage changes with (current - previous) / previous * 100.",
+    "Anomalies (e.g., realization > 200%, utilization < 80%) are highlighted in responses, with thresholds defined in query logic (e.g., HAVING clauses).",
+    "Aggregations (e.g., SUM(worked_hours), COUNT(matter_id)) are used for totals, with STRING_AGG for concatenating lists (e.g., practice_group, rate_set_code).",
+    "Rankings (e.g., top 10 clients by hours) use RANK() OVER (ORDER BY metric DESC) to prioritize high-impact records.",
+
+    # Data Handling and Validation
+    "Nullable fields (e.g., worked_amount, standard_amount) are handled with COALESCE to prevent null results in aggregations.",
+    "Data errors (e.g., worked_amount > standard_amount, null worked_rate) are flagged in responses, recommending investigation.",
+    "The is_error = ‘N’ flag in matter_timekeeper_summary ensures accurate aggregations by excluding erroneous entries.",
+    "Currency mismatches (e.g., worked_currency vs. matter_currency) are noted as potential billing errors, requiring manual review.",
+    "Missing columns (e.g., outstanding balances, contact information) are acknowledged as limitations, with approximations (e.g., client_name for contact) used where possible.",
+    "Statistical measures (e.g., standard deviation of worked_rate / standard_rate) quantify variability in billing practices when requested.",
+
+    # Error and Ambiguity Handling
+    "Unclear queries (e.g., ‘List my stuff’) prompt clarification: ‘Please specify clients, matters, or another category, with details like time period or filters.’",
+    "Out-of-scope queries (e.g., non-legal data) return: ‘This query is outside the rate model schema’s scope. Please provide a query about clients, matters, or billing.’",
+    "Invalid inputs (e.g., non-existent names) trigger: ‘No results found for the specified criteria (e.g., name not found). Please verify and try again.’",
+    "If no matching training query exists, the assistant attempts to generate a new SQL query based on schema knowledge, or responds: ‘Unable to generate a query. Please rephrase or provide more details.’",
 ]
 
-ddl_statements = [
-    # timecard table
-    'Table: timecard - Column: timecard_id, Type: text, Nullable: YES - Column: timekeeper_id, Type: text, Nullable: YES - Column: matter_id, Type: text, Nullable: YES - Column: date, Type: timestamp without time zone, Nullable: YES - Column: time_type, Type: text, Nullable: YES - Column: is_flat_fee, Type: text, Nullable: YES - Column: is_nonbillable, Type: text, Nullable: YES - Column: is_no_charge, Type: text, Nullable: YES - Column: is_active, Type: text, Nullable: YES - Column: worked_hours, Type: double precision, Nullable: YES - Column: worked_rate, Type: bigint, Nullable: YES - Column: worked_amount, Type: bigint, Nullable: YES - Column: worked_currency, Type: text, Nullable: YES - Column: standard_rate, Type: bigint, Nullable: YES - Column: standard_amount, Type: bigint, Nullable: YES - Column: standard_rate_currency, Type: text, Nullable: YES',
-    'Adding ddl: CREATE TABLE timecard ("timecard_id" TEXT, "timekeeper_id" TEXT, "matter_id" TEXT, "date" TIMESTAMP WITHOUT TIME ZONE, "time_type" TEXT, "is_flat_fee" TEXT, "is_nonbillable" TEXT, "is_no_charge" TEXT, "is_active" TEXT, "worked_hours" DOUBLE PRECISION, "worked_rate" BIGINT, "worked_amount" BIGINT, "worked_currency" TEXT, "standard_rate" BIGINT, "standard_amount" BIGINT, "standard_rate_currency" TEXT);',
-
-    # matter_timekeeper_summary table
-    'Table: matter_timekeeper_summary - Column: tk_mat_sum_id, Type: text, Nullable: YES - Column: matter_id, Type: text, Nullable: YES - Column: timekeeper_id, Type: text, Nullable: YES - Column: year, Type: bigint, Nullable: YES - Column: worked_hours, Type: bigint, Nullable: YES - Column: worked_amount, Type: bigint, Nullable: YES - Column: standard_amount, Type: bigint, Nullable: YES - Column: currency, Type: text, Nullable: YES - Column: is_error, Type: text, Nullable: YES - Column: error_message, Type: double precision, Nullable: YES',
-    'Adding ddl: CREATE TABLE matter_timekeeper_summary ("tk_mat_sum_id" TEXT, "matter_id" TEXT, "timekeeper_id" TEXT, "year" BIGINT, "worked_hours" BIGINT, "worked_amount" BIGINT, "standard_amount" BIGINT, "currency" TEXT, "is_error" TEXT, "error_message" DOUBLE PRECISION);',
-
-    # timekeeper table
-    'Table: timekeeper - Column: timekeeper_id, Type: text, Nullable: YES - Column: timekeeper_number, Type: bigint, Nullable: YES - Column: timekeeper_name, Type: text, Nullable: YES - Column: timekeeper_sort_name, Type: text, Nullable: YES - Column: is_active, Type: text, Nullable: YES - Column: rate_year, Type: double precision, Nullable: YES - Column: type, Type: text, Nullable: YES - Column: attribute, Type: text, Nullable: YES - Column: category, Type: text, Nullable: YES - Column: budget_hours, Type: double precision, Nullable: YES - Column: cost_rate, Type: double precision, Nullable: YES - Column: cost_rate_currency, Type: text, Nullable: YES - Column: is_current, Type: text, Nullable: YES - Column: is_error, Type: text, Nullable: YES - Column: error_message, Type: text, Nullable: YES',
-    'Adding ddl: CREATE TABLE timekeeper ("timekeeper_id" TEXT, "timekeeper_number" BIGINT, "timekeeper_name" TEXT, "timekeeper_sort_name" TEXT, "is_active" TEXT, "rate_year" DOUBLE PRECISION, "type" TEXT, "attribute" TEXT, "category" TEXT, "budget_hours" DOUBLE PRECISION, "cost_rate" DOUBLE PRECISION, "cost_rate_currency" TEXT, "is_current" TEXT, "is_error" TEXT, "error_message" TEXT);',
-
-    # matter table
-    'Table: matter - Column: matter_id, Type: text, Nullable: YES - Column: matter_number, Type: text, Nullable: YES - Column: matter_name, Type: text, Nullable: YES - Column: client_id, Type: text, Nullable: YES - Column: related_matter_id, Type: text, Nullable: YES - Column: is_active, Type: text, Nullable: YES - Column: open_date, Type: timestamp without time zone, Nullable: YES - Column: matter_currency, Type: text, Nullable: YES - Column: rate_set_id, Type: text, Nullable: YES - Column: notification_days, Type: double precision, Nullable: YES - Column: rate_review_date, Type: timestamp without time zone, Nullable: YES - Column: billing_timekeeper_id, Type: text, Nullable: YES - Column: responsible_timekeeper_id, Type: text, Nullable: YES - Column: supervising_timekeeper_id, Type: text, Nullable: YES - Column: type, Type: text, Nullable: YES - Column: attribute, Type: text, Nullable: YES - Column: category, Type: text, Nullable: YES - Column: is_proforma_adjustments, Type: text, Nullable: YES - Column: is_flat_fees, Type: text, Nullable: YES - Column: is_ebilled, Type: text, Nullable: YES - Column: is_current, Type: text, Nullable: YES - Column: is_error, Type: text, Nullable: YES - Column: error_message, Type: double precision, Nullable: YES',
-    'Adding ddl: CREATE TABLE matter ("matter_id" TEXT, "matter_number" TEXT, "matter_name" TEXT, "client_id" TEXT, "related_matter_id" TEXT, "is_active" TEXT, "open_date" TIMESTAMP WITHOUT TIME ZONE, "matter_currency" TEXT, "rate_set_id" TEXT, "notification_days" DOUBLE PRECISION, "rate_review_date" TIMESTAMP WITHOUT TIME ZONE, "billing_timekeeper_id" TEXT, "responsible_timekeeper_id" TEXT, "supervising_timekeeper_id" TEXT, "type" TEXT, "attribute" TEXT, "category" TEXT, "is_proforma_adjustments" TEXT, "is_flat_fees" TEXT, "is_ebilled" TEXT, "is_current" TEXT, "is_error" TEXT, "error_message" DOUBLE PRECISION);',
-
-    # client table
-    'Table: client - Column: client_id, Type: text, Nullable: YES - Column: client_number, Type: bigint, Nullable: YES - Column: client_name, Type: text, Nullable: YES - Column: related_client_id, Type: text, Nullable: YES - Column: is_active, Type: text, Nullable: YES - Column: open_date, Type: timestamp without time zone, Nullable: YES - Column: rate_set_id, Type: text, Nullable: YES - Column: notification_days, Type: double precision, Nullable: YES - Column: rate_review_date, Type: timestamp without time zone, Nullable: YES - Column: year_end_month, Type: double precision, Nullable: YES - Column: type, Type: text, Nullable: YES - Column: attribute, Type: text, Nullable: YES - Column: category, Type: text, Nullable: YES - Column: relationship_timekeeper_id, Type: text, Nullable: YES - Column: is_proforma_adjustments, Type: text, Nullable: YES - Column: is_ebilled, Type: text, Nullable: YES - Column: is_current, Type: text, Nullable: YES - Column: is_error, Type: text, Nullable: YES - Column: error_message, Type: text, Nullable: YES',
-    'Adding ddl: CREATE TABLE client ("client_id" TEXT, "client_number" BIGINT, "client_name" TEXT, "related_client_id" TEXT, "is_active" TEXT, "open_date" TIMESTAMP WITHOUT TIME ZONE, "rate_set_id" TEXT, "notification_days" DOUBLE PRECISION, "rate_review_date" TIMESTAMP WITHOUT TIME ZONE, "year_end_month" DOUBLE PRECISION, "type" TEXT, "attribute" TEXT, "category" TEXT, "relationship_timekeeper_id" TEXT, "is_proforma_adjustments" TEXT, "is_ebilled" TEXT, "is_current" TEXT, "is_error" TEXT, "error_message" TEXT);',
-
-    # rate_set table
-    'Table: rate_set - Column: rate_set_id, Type: text, Nullable: YES - Column: rate_set_code, Type: text, Nullable: YES - Column: rate_set_name, Type: text, Nullable: YES',
-    'Adding ddl: CREATE TABLE rate_set ("rate_set_id" TEXT, "rate_set_code" TEXT, "rate_set_name" TEXT);',
-
-    # rate_set_link table
-    'Table: rate_set_link - Column: rate_set_link_id, Type: text, Nullable: YES - Column: rate_set_id, Type: text, Nullable: YES - Column: rate_component_id, Type: text, Nullable: YES - Column: rate_type, Type: text, Nullable: YES - Column: start_date, Type: double precision, Nullable: YES - Column: end_date, Type: double precision, Nullable: YES - Column: ordinal, Type: bigint, Nullable: YES',
-    'Adding ddl: CREATE TABLE rate_set_link ("rate_set_link_id" TEXT, "rate_set_id" TEXT, "rate_component_id" TEXT, "rate_type" TEXT, "start_date" DOUBLE PRECISION, "end_date" DOUBLE PRECISION, "ordinal" BIGINT);',
-
-    # rate_component table
-    'Table: rate_component - Column: rate_component_id, Type: text, Nullable: YES - Column: rate_type, Type: text, Nullable: YES - Column: rate_num, Type: bigint, Nullable: YES - Column: source_code, Type: text, Nullable: YES - Column: source_name, Type: text, Nullable: YES - Column: start_date, Type: timestamp without time zone, Nullable: YES - Column: end_date, Type: timestamp without time zone, Nullable: YES - Column: frozen_date, Type: timestamp without time zone, Nullable: YES - Column: is_step_up, Type: text, Nullable: YES - Column: is_skip_client_exceptions, Type: text, Nullable: YES - Column: default_rate_amount, Type: double precision, Nullable: YES - Column: default_currency, Type: text, Nullable: YES - Column: is_match_currency, Type: text, Nullable: YES - Column: is_error, Type: text, Nullable: YES - Column: error_message, Type: double precision, Nullable: YES',
-    'Adding ddl: CREATE TABLE rate_component ("rate_component_id" TEXT, "rate_type" TEXT, "rate_num" BIGINT, "source_code" TEXT, "source_name" TEXT, "start_date" TIMESTAMP WITHOUT TIME ZONE, "end_date" TIMESTAMP WITHOUT TIME ZONE, "frozen_date" TIMESTAMP WITHOUT TIME ZONE, "is_step_up" TEXT, "is_skip_client_exceptions" TEXT, "default_rate_amount" DOUBLE PRECISION, "default_currency" TEXT, "is_match_currency" TEXT, "is_error" TEXT, "error_message" DOUBLE PRECISION);',
-
-    # rate_detail table
-    'Table: rate_detail - Column: rate_detail_id, Type: text, Nullable: YES - Column: rate_component_id, Type: text, Nullable: YES - Column: is_virtual, Type: text, Nullable: YES - Column: start_date, Type: timestamp without time zone, Nullable: YES - Column: end_date, Type: timestamp without time zone, Nullable: YES - Column: ordinal, Type: bigint, Nullable: YES - Column: rate_id, Type: text, Nullable: YES - Column: rate_amount, Type: double precision, Nullable: YES - Column: deviation_amount, Type: double precision, Nullable: YES - Column: deviation_percent, Type: double precision, Nullable: YES - Column: rate_currency, Type: text, Nullable: YES - Column: rounding_method, Type: text, Nullable: YES - Column: matter_rate_min, Type: double precision, Nullable: YES - Column: matter_rate_max, Type: double precision, Nullable: YES - Column: timekeeper_id, Type: text, Nullable: YES - Column: title, Type: text, Nullable: YES - Column: officet, Type: text, Nullable: YES - Column: officem, Type: text, Nullable: YES - Column: rate_class, Type: text, Nullable: YES - Column: departmentt, Type: text, Nullable: YES - Column: departmentm, Type: text, Nullable: YES - Column: sectiont, Type: text, Nullable: YES - Column: sectionm, Type: text, Nullable: YES - Column: rate_year_min, Type: double precision, Nullable: YES - Column: rate_year_max, Type: double precision, Nullable: YES - Column: arrangement, Type: text, Nullable: YES - Column: practice_group, Type: text, Nullable: YES',
-    'Adding ddl: CREATE TABLE rate_detail ("rate_detail_id" TEXT, "rate_component_id" TEXT, "is_virtual" TEXT, "start_date" TIMESTAMP WITHOUT TIME ZONE, "end_date" TIMESTAMP WITHOUT TIME ZONE, "ordinal" BIGINT, "rate_id" TEXT, "rate_amount" DOUBLE PRECISION, "deviation_amount" DOUBLE PRECISION, "deviation_percent" DOUBLE PRECISION, "rate_currency" TEXT, "rounding_method" TEXT, "matter_rate_min" DOUBLE PRECISION, "matter_rate_max" DOUBLE PRECISION, "timekeeper_id" TEXT, "title" TEXT, "officet" TEXT, "officem" TEXT, "rate_class" TEXT, "departmentt" TEXT, "departmentm" TEXT, "sectiont" TEXT, "sectionm" TEXT, "rate_year_min" DOUBLE PRECISION, "rate_year_max" DOUBLE PRECISION, "arrangement" TEXT, "practice_group" TEXT);',
+# Schema Training
+# Get table schema information for all tables we need to train on
+required_tables = [
+    'client', 'matter', 'matter_date', 'matter_timekeeper_summary',
+    'rate_component', 'rate_detail', 'rate_set_link', 'rate_set',
+    'timekeeper', 'timekeeper_date', 'timecard'
 ]
 
+# Get column information for each table using information_schema
+table_names_sql = "', '".join(required_tables)
+df_columns = vn.run_sql(f"""
+    SELECT 
+        table_name,
+        column_name,
+        data_type,
+        is_nullable,
+        column_default
+    FROM information_schema.columns 
+    WHERE table_schema = 'public'
+    AND table_name IN ('{table_names_sql}')
+    ORDER BY table_name, ordinal_position
+""")
 
-for sql, question in underbilling_sql_training:
-    vn.train(sql=sql, question=question)
+# Train on table schema information
+if not df_columns.empty:
+    # Group columns by table and create schema documentation
+    for table_name in df_columns['table_name'].unique():
+        table_cols = df_columns[df_columns['table_name'] == table_name]
+        
+        # Create a simple table description for training
+        col_descriptions = []
+        for _, row in table_cols.iterrows():
+            nullable = "NULL" if row['is_nullable'] == 'YES' else "NOT NULL"
+            default = f" DEFAULT {row['column_default']}" if row['column_default'] else ""
+            col_desc = f"  {row['column_name']} {row['data_type']} {nullable}{default}"
+            col_descriptions.append(col_desc)
+        
+        table_ddl = f"CREATE TABLE {table_name} (\n" + ",\n".join(col_descriptions) + "\n);"
+        vn.train(ddl=table_ddl)
 
-for doc in underbilling_documentation:
-    vn.train(documentation=doc)
+# Verify all required tables were found
+found_tables = set(df_columns['table_name'].unique()) if not df_columns.empty else set()
+missing_tables = set(required_tables) - found_tables
+if missing_tables:
+    print(f"Warning: Could not find schema for tables: {missing_tables}")
 
 
-for ddl in ddl_statements:
-    vn.train(ddl=ddl)
+for sql_query, training_question in general_query_sql_training:
+    vn.train(sql=sql_query, question=training_question)
+
+for documentation_text in general_query_documentation:
+    vn.train(documentation=documentation_text)
+
 
 app = FastAPI(title="Underbilling Agent API")
 

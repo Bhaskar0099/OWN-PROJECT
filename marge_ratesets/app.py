@@ -1,11 +1,13 @@
 import pandas as pd
 import os
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 import logging
 from pandasai import Agent
 from pandasai.llm import OpenAI
 import warnings
+import numpy as np
+import random
 warnings.filterwarnings('ignore')
 
 # Setup logging
@@ -23,12 +25,20 @@ class RateSetMerger:
         self.password = os.getenv('POSTGRES_PASSWORD', '123')
 
         self.connection_string = f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
-        self.engine = create_engine(self.connection_string)
+        try:
+            self.engine = create_engine(self.connection_string)
+            logger.info("✅ Database engine created successfully")
+        except Exception as e:
+            logger.error(f"Failed to create database engine: {e}")
+            self.engine = None
 
         # Setup PandasAI
         self.llm = self._setup_openai_llm()
         self.agent = None
         self.current_data = None
+        
+        # Flag to use mock data if database connection fails
+        self.use_mock_data = False
 
     def _setup_openai_llm(self):
         """Setup OpenAI LLM for PandasAI"""
@@ -49,11 +59,77 @@ class RateSetMerger:
             logger.error(f"OpenAI LLM setup failed: {e}")
             return None
 
+    def _generate_mock_data(self):
+        """Generate mock data for testing when database is not available"""
+        logger.info("Generating mock data for testing...")
+        
+        # Practice areas
+        practice_areas = ['Litigation', 'Corporate', 'Tax', 'Real Estate', 'IP', 'Employment']
+        
+        # Rate classes
+        rate_classes = ['Partner', 'Associate', 'Senior Associate', 'Of Counsel', 'Paralegal']
+        
+        # Generate 20 mock rate sets
+        mock_data = []
+        
+        for i in range(1, 21):
+            # Generate base rate amount (between $300 and $800)
+            base_rate = random.uniform(300, 800)
+            
+            # Select 1-2 practice areas
+            num_areas = random.randint(1, 2)
+            selected_areas = '|'.join(random.sample(practice_areas, num_areas))
+            
+            # Select 1-3 rate classes
+            num_classes = random.randint(1, 3)
+            selected_classes = '|'.join(random.sample(rate_classes, num_classes))
+            
+            # Create similar rate sets with small variations
+            if i % 2 == 0:  # Create pairs of similar rate sets
+                # Adjust rate by small percentage (within 5%)
+                rate_adjustment = base_rate * random.uniform(-0.04, 0.04)
+                adjusted_rate = base_rate + rate_adjustment
+                
+                # Use same practice areas as previous
+                practice_area = mock_data[i-2]['practice_areas']
+                
+                # Similar client counts
+                client_count = mock_data[i-2]['client_count'] + random.randint(-1, 1)
+                client_count = max(1, client_count)  # Ensure at least 1 client
+                
+                # Similar matter counts
+                matter_count = mock_data[i-2]['matter_count'] + random.randint(-2, 2)
+                matter_count = max(0, matter_count)  # Ensure non-negative
+            else:
+                adjusted_rate = base_rate
+                practice_area = selected_areas
+                client_count = random.randint(1, 10)
+                matter_count = random.randint(0, 20)
+            
+            mock_data.append({
+                'rate_set_id': i,
+                'rate_set_name': f"Rate Set {i}",
+                'rate_set_code': f"RS{i:03d}",
+                'final_rate_amount': adjusted_rate,
+                'discount_structure': selected_classes,
+                'practice_areas': practice_area,
+                'assigned_clients': f"Client {i}|Client {i+1}" if client_count > 1 else f"Client {i}",
+                'matter_count': matter_count,
+                'client_count': client_count
+            })
+        
+        logger.info(f"Generated {len(mock_data)} mock rate sets")
+        return pd.DataFrame(mock_data)
+
     def capture_key_attributes(self):
         """
         Step 1: For each existing rate set, capture key attributes
         (rate amounts, discount structure, matter or client exception, etc.)
         """
+        if not self.engine or self.use_mock_data:
+            logger.warning("Database connection not available or using mock data - generating sample data instead")
+            return self._generate_mock_data()
+            
         query = """
         SELECT
             rs.rate_set_id,
@@ -76,9 +152,20 @@ class RateSetMerger:
         """
 
         logger.info("Capturing key attributes for all rate sets...")
-        rate_sets = pd.read_sql_query(query, self.engine)
-        logger.info(f"Captured attributes for {len(rate_sets)} rate sets")
-        return rate_sets
+        try:
+            # Use the engine directly with a string query
+            rate_sets = pd.read_sql_query(query, self.engine)
+            if rate_sets.empty:
+                logger.warning("No rate sets found in database - switching to mock data")
+                return self._generate_mock_data()
+                
+            logger.info(f"Captured attributes for {len(rate_sets)} rate sets")
+            return rate_sets
+        except Exception as e:
+            logger.error(f"Error capturing rate set attributes: {e}")
+            logger.warning("Switching to mock data for demonstration")
+            self.use_mock_data = True
+            return self._generate_mock_data()
 
     def compare_sets_and_identify_candidates(self, rate_sets, threshold_percent=5.0):
         """
@@ -86,6 +173,12 @@ class RateSetMerger:
         but are assigned to similar matter/client contexts, mark them as "merge candidates."
         """
         logger.info(f"Comparing rate sets with {threshold_percent}% threshold...")
+        
+        # Check if rate_sets is empty
+        if rate_sets.empty:
+            logger.warning("No rate sets available for comparison")
+            return pd.DataFrame()
+            
         merge_candidates = []
 
         for i, set1 in rate_sets.iterrows():
@@ -304,7 +397,7 @@ class RateSetMerger:
         print("   • 'Show a pie chart of prime vs regular candidates'")
         print("   • 'What is the total savings potential?'")
         print("   • 'Create a scatter plot of rate differences vs matters affected'")
-        print("   • 'Show me merges with 0% rate difference'")
+        print("   • 'Show me merges with 0% rate difference'")                                                                                            
         print("   • 'Group merges by practice areas'")
 
         print("\n" + "="*60)
@@ -347,7 +440,7 @@ class RateSetMerger:
             print("2. Comparing sets for <5% difference in similar contexts")
             print("3. Evaluating matter assignments for prime candidates")
             print("4. Proposing merges with justifications")
-            print("5. Interactive AI analysis with charts")
+            print("5. Interactive AI analysis with charts") 
 
             # Step 1: Capture key attributes
             rate_sets = self.capture_key_attributes()
