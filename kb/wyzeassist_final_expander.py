@@ -273,7 +273,7 @@ class QuestionExpanderAPI:
             
             # Step 3: LLM Processing with Single System Prompt
             system_prompt = f"""
-You are WyzeAssist, a legal/business analytics assistant. Your primary task is to transform the user's short question into a detailed, actionable query. Even if the question seems simple, expand it with as much relevant detail as possible. Only provide question recommendations if the question is completely unintelligible.
+You are WyzeAssist, a legal/business analytics assistant. Your primary task is to transform the user's short question into a detailed, actionable query. Even if the question seems simple, expand it into a concise, single-sentence query. Only provide question recommendations if the question is completely unintelligible.
 
 CONTEXT:
 - Abbreviations and definitions (use these to expand questions): 
@@ -282,12 +282,11 @@ CONTEXT:
 
 INSTRUCTIONS:
 1. Carefully read the user's question.
-2. **Always attempt to expand the question into a detailed, actionable query.**
+2. **Always attempt to expand the question into a detailed, actionable query in a SINGLE SENTENCE.**
    - Use the available abbreviations and user context.
-   - **IMPORTANT: If user context is provided (e.g., "for lynn"), include the user's name in the expanded query.**
-   - Add relevant timeframes, metrics, and filters.
-   - Focus on legal billing context.
-   - Even for short questions, provide a detailed expansion.
+   - **Do not ask for additional fields or details. Infer them from the context.**
+   - **Keep the expanded query concise and to the point.**
+   - If user context is provided (e.g., "for lynn"), include the user's name in the expanded query.
    - Replace personal pronouns (my, mine, I, me) with the specific user name when user context is available.
 3. **Only if the question is COMPLETELY UNINTELLIGIBLE:**
    - Respond with: "I couldn't fully understand your question. Here are some questions you might want to ask:"
@@ -296,7 +295,7 @@ INSTRUCTIONS:
    - After the suggestions, add this message: "If none of these questions match your intent, please rephrase or provide more details so I can assist you better."
 
 RESPONSE FORMAT:
-- **If EXPANDABLE:** [Expanded Query with user name included if user context is provided]
+- **If EXPANDABLE:** [Concise, single-sentence expanded query with user name included if user context is provided]
 - **If COMPLETELY UNINTELLIGIBLE:**
 I couldn't fully understand your question. Here are some questions you might want to ask:
 1. [First suggested question]
@@ -308,8 +307,7 @@ EXAMPLES:
 - If user asks "List my clients" and user context is "for lynn" → "List all clients for lynn, including client names, contact information, active matters, and total fees paid to date."
 - If user asks "TK hours" and no user context → "Show Timekeeper worked hours and billed hours for all active Timekeepers this month."
 
-USER QUESTION: {question}
-"""
+USER QUESTION: {question}"""
             
             response = self.llm([HumanMessage(content=system_prompt)])
             llm_response = response.content.strip()
@@ -602,4 +600,4 @@ if __name__ == "__main__":
     print("Complete workflow: Similarity Search → Smart User Detection → LLM Processing → Recommendations")
     print("Full CRUD operations for abbreviation management")
     print("Make sure OPENAI_API_KEY environment variable is set")
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8001, reload=True)
