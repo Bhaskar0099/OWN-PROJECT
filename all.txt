@@ -1,0 +1,2380 @@
+OWN-PROJECT
+|
+|_underbilling_agent
+  |_cli.py
+|_profitability_agent
+  |_cli.py
+|_cross_matter_rate_consistency_agent
+  |_cli.py
+|_supervisor_agent
+  |_cli.py
+|_.env
+
+________________________________________________________________________________________________________________________
+
+undebilling_agent/cli.py
+
+#!/usr/bin/env python3
+import os
+import uuid
+import json
+import argparse
+import tempfile
+
+import pandas as pd
+from dotenv import load_dotenv
+
+import plotly.express as px
+import plotly.io as pio
+import plotly.basedatatypes as _bdt
+import plotly.graph_objects as go
+
+import openai
+from vanna.openai import OpenAI_Chat
+from vanna.chromadb import ChromaDB_VectorStore
+
+# Prevent Plotly from auto‐opening a browser
+pio.renderers.default = "svg"
+_bdt.BaseFigure.show = lambda *args, **kwargs: None
+
+# Load .env
+load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+
+def summarize(question: str, records: list[dict]) -> str:
+    system_msg = (
+        "You are a data-analysis assistant. "
+        "When given a user’s question and a JSON array of row objects, "
+        "your task is to produce a concise, narrative summary: "
+        "focus on overall patterns, counts, and high-level insights rather than listing each row."
+    )
+    user_msg = (
+        f"Here is the user’s question: {question}\n\n"
+        f"Below are up to 100 rows of raw results:\n{json.dumps(records, indent=2)}"
+    )
+    resp = openai.chat.completions.create(
+        model="gpt-4.1-nano",
+        temperature=0.0,
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user",   "content": user_msg},
+        ]
+    )
+    return resp.choices[0].message.content.strip()
+
+
+class MyVanna(ChromaDB_VectorStore, OpenAI_Chat):
+    def __init__(self, config=None):
+        ChromaDB_VectorStore.__init__(self, config=config)
+        OpenAI_Chat.__init__(self, config=config)
+
+    def ask(self, question, **kwargs):
+        result = super().ask(question, **kwargs)
+        if result is None:
+            return None
+
+        df, fig = None, None
+        if isinstance(result, tuple):
+            if len(result) == 3 and isinstance(result[2], _bdt.BaseFigure):
+                _, df, fig = result
+            elif len(result) >= 2 and isinstance(result[1], pd.DataFrame):
+                _, df = result[0], result[1]
+            elif isinstance(result[0], pd.DataFrame):
+                df = result[0]
+        elif isinstance(result, pd.DataFrame):
+            df = result
+
+        if df is None or df.empty:
+            return None
+
+        html_str = None
+        if fig and isinstance(fig, (_bdt.BaseFigure, go.Figure)):
+            html_str = fig.to_html(include_plotlyjs="cdn")
+        elif len(df.columns) >= 2:
+            x, y = df.columns[:2]
+            fallback = px.bar(df.head(10), x=x, y=y, title=f"{y} by {x}")
+            html_str = fallback.to_html(include_plotlyjs="cdn")
+
+        chart_url = None
+        if html_str:
+            charts_dir = os.getenv("CHARTS_DIR", os.path.join(tempfile.gettempdir(), "underbilling_cli_charts"))
+            os.makedirs(charts_dir, exist_ok=True)
+            chart_filename = f"{uuid.uuid4()}.html"
+            chart_path = os.path.join(charts_dir, chart_filename)
+            with open(chart_path, "w", encoding="utf-8") as f:
+                f.write(html_str)
+            chart_url = f"http://127.0.0.1:8000/{chart_filename}"
+
+        records = df.head(100).copy()
+        for col in records.select_dtypes(include=["datetime64[ns]"]):
+            records[col] = records[col].dt.strftime("%Y-%m-%dT%H:%M:%S")
+        data = records.to_dict(orient="records")
+
+        try:
+            summary = summarize(question, data)
+        except Exception as e:
+            summary = f"Could not generate summary: {e}"
+
+        return {
+            "df": df,
+            "chart_url": chart_url,
+            "summary": summary
+        }
+
+
+underbilling_sql_training = [
+    (
+        'SELECT DISTINCT t."timekeeper_name" '
+        'FROM "timecard" tc '
+        'JOIN "timekeeper" t ON tc."timekeeper_id" = t."timekeeper_id" '
+        'WHERE tc."is_nonbillable" = \'Y\' '
+        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
+        'AND tc."is_active" = \'Y\' '
+        'AND t."is_active" = \'Y\' '
+        'ORDER BY t."timekeeper_name";',
+        "Which timekeepers have non-billable hours recorded in 2025?"
+    ),
+    (
+        'SELECT m."matter_name", SUM(tc."worked_hours") AS no_charge_hours '
+        'FROM "timecard" tc '
+        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
+        'WHERE tc."is_no_charge" = \'Y\' '
+        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
+        'AND tc."is_active" = \'Y\' '
+        'AND m."is_active" = \'Y\' '
+        'GROUP BY m."matter_name" '
+        'ORDER BY no_charge_hours DESC '
+        'LIMIT 5;',
+        "Which matters have the most no-charge hours in 2025?"
+    ),
+    (
+        'SELECT c."client_name", ROUND(SUM(mts."standard_amount" - mts."worked_amount")::numeric, 2) AS total_underbilling '
+        'FROM "matter_timekeeper_summary" mts '
+        'JOIN "matter" m ON mts."matter_id" = m."matter_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE mts."year" = 2025 '
+        'AND mts."is_error" = \'N\' '
+        'AND c."is_active" = \'Y\' '
+        'GROUP BY c."client_name" '
+        'ORDER BY total_underbilling DESC '
+        'LIMIT 5;',
+        "Which clients have the highest total underbilling amount in 2025?"
+    ),
+    (
+        'SELECT t."timekeeper_name", ROUND(AVG(tc."worked_rate" / NULLIF(tc."standard_rate", 0) * 100)::numeric, 2) AS realization_rate '
+        'FROM "timecard" tc '
+        'JOIN "timekeeper" t ON tc."timekeeper_id" = t."timekeeper_id" '
+        'WHERE EXTRACT(YEAR FROM tc."date") = 2025 '
+        'AND tc."is_active" = \'Y\' '
+        'AND t."is_active" = \'Y\' '
+        'AND tc."is_nonbillable" = \'N\' '
+        'GROUP BY t."timekeeper_name" '
+        'HAVING AVG(tc."worked_rate" / NULLIF(tc."standard_rate", 0) * 100) < 85 '
+        'ORDER BY realization_rate ASC;',
+        "Which timekeepers have an average realization rate below 85% for billable timecards in 2025?"
+    ),
+    (
+        'SELECT m."matter_name", ROUND(AVG(rd."deviation_amount")::numeric, 2) AS avg_discount '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        'AND m."is_active" = \'Y\' '
+        'GROUP BY m."matter_name" '
+        'HAVING AVG(rd."deviation_amount") > 500 '
+        'ORDER BY avg_discount DESC;',
+        "Which matters have an average discount amount greater than $500 in 2025?"
+    ),
+    (
+        'SELECT t."timekeeper_name", COUNT(tc."timecard_id") AS low_rate_timecards '
+        'FROM "timecard" tc '
+        'JOIN "timekeeper" t ON tc."timekeeper_id" = t."timekeeper_id" '
+        'WHERE tc."worked_rate" < 0.8 * tc."standard_rate" '
+        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
+        'AND tc."is_active" = \'Y\' '
+        'AND tc."is_nonbillable" = \'N\' '
+        'AND tc."is_no_charge" = \'N\' '
+        'AND t."is_active" = \'Y\' '
+        'GROUP BY t."timekeeper_name" '
+        'ORDER BY low_rate_timecards DESC '
+        'LIMIT 5;',
+        "Which timekeepers have the most timecards with rates below 80% of standard rates in 2025?"
+    ),
+    (
+        'SELECT m."type", ROUND(SUM(mts."standard_amount" - mts."worked_amount")::numeric, 2) AS total_underbilling '
+        'FROM "matter_timekeeper_summary" mts '
+        'JOIN "matter" m ON mts."matter_id" = m."matter_id" '
+        'WHERE mts."year" = 2025 '
+        'AND mts."is_error" = \'N\' '
+        'AND m."is_active" = \'Y\' '
+        'GROUP BY m."type" '
+        'ORDER BY total_underbilling DESC;',
+        "Which matter types have the highest total underbilling in 2025?"
+    ),
+    (
+        'SELECT m."matter_name", '
+        'ROUND((SUM(CASE WHEN tc."is_nonbillable" = \'Y\' THEN tc."worked_hours" ELSE 0 END) / NULLIF(SUM(tc."worked_hours"), 0) * 100)::numeric, 2) AS non_billable_percent '
+        'FROM "timecard" tc '
+        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
+        'WHERE EXTRACT(YEAR FROM tc."date") = 2025 '
+        'AND tc."is_active" = \'Y\' '
+        'AND m."is_active" = \'Y\' '
+        'GROUP BY m."matter_name" '
+        'HAVING SUM(CASE WHEN tc."is_nonbillable" = \'Y\' THEN tc."worked_hours" ELSE 0 END) / NULLIF(SUM(tc."worked_hours"), 0) > 0.25 '
+        'ORDER BY non_billable_percent DESC;',
+        "Which matters have more than 25% non-billable hours in 2025?"
+    ),
+    (
+        'SELECT c."client_name", COUNT(DISTINCT tc."timecard_id") AS error_timecards '
+        'FROM "timecard" tc '
+        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE tc."worked_amount" > tc."standard_amount" '
+        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
+        'AND tc."is_active" = \'Y\' '
+        'AND c."is_active" = \'Y\' '
+        'GROUP BY c."client_name" '
+        'ORDER BY error_timecards DESC;',
+        "Which clients have timecards with worked amounts exceeding standard amounts in 2025?"
+    ),
+    (
+        'SELECT t."timekeeper_name", ROUND(AVG(mts."standard_amount" - mts."worked_amount")::numeric, 2) AS avg_underbilling '
+        'FROM "matter_timekeeper_summary" mts '
+        'JOIN "timekeeper" t ON mts."timekeeper_id" = t."timekeeper_id" '
+        'WHERE mts."year" = 2025 '
+        'AND mts."is_error" = \'N\' '
+        'AND t."is_active" = \'Y\' '
+        'GROUP BY t."timekeeper_name" '
+        'ORDER BY avg_underbilling DESC '
+        'LIMIT 5;',
+        "Which timekeepers have the highest average underbilling amount per matter in 2025?"
+    ),
+    (
+        'SELECT m."matter_name", ROUND(AVG(rd."deviation_percent" * 100)::numeric, 2) AS avg_discount_percent '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        'AND m."is_active" = \'Y\' '
+        'GROUP BY m."matter_name" '
+        'HAVING AVG(rd."deviation_percent" * 100) > 15 '
+        'ORDER BY avg_discount_percent DESC;',
+        "Which matters have an average discount percentage above 15% in 2025?"
+    ),
+    (
+        'SELECT t."type" AS timekeeper_type, ROUND(SUM(tc."worked_hours")::numeric, 2) AS non_billable_hours '
+        'FROM "timecard" tc '
+        'JOIN "timekeeper" t ON tc."timekeeper_id" = t."timekeeper_id" '
+        'WHERE tc."is_nonbillable" = \'Y\' '
+        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
+        'AND tc."is_active" = \'Y\' '
+        'AND t."is_active" = \'Y\' '
+        'GROUP BY t."type" '
+        'ORDER BY non_billable_hours DESC;',
+        "Which timekeeper types have the most non-billable hours in 2025?"
+    ),
+    (
+        'SELECT m."matter_name", COUNT(tc."timecard_id") AS currency_mismatch '
+        'FROM "timecard" tc '
+        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
+        'WHERE tc."worked_currency" != m."matter_currency" '
+        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
+        'AND tc."is_active" = \'Y\' '
+        'AND m."is_active" = \'Y\' '
+        'GROUP BY m."matter_name" '
+        'ORDER BY currency_mismatch DESC;',
+        "Which matters have timecards with currency mismatches in 2025?"
+    ),
+    (
+        'SELECT c."client_name", ROUND(SUM(tc."worked_hours")::numeric, 2) AS no_charge_hours '
+        'FROM "timecard" tc '
+        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE tc."is_no_charge" = \'Y\' '
+        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
+        'AND tc."is_active" = \'Y\' '
+        'AND c."is_active" = \'Y\' '
+        'GROUP BY c."client_name" '
+        'ORDER BY no_charge_hours DESC '
+        'LIMIT 5;',
+        "Which clients have the most no-charge hours across their matters in 2025?"
+    ),
+    (
+        'SELECT t."timekeeper_name", '
+        'ROUND(SUM(mts."standard_amount" - mts."worked_amount") / NULLIF(SUM(mts."worked_hours"), 0)::numeric, 2) AS underbilling_per_hour '
+        'FROM "matter_timekeeper_summary" mts '
+        'JOIN "timekeeper" t ON mts."timekeeper_id" = t."timekeeper_id" '
+        'WHERE mts."year" = 2025 '
+        'AND mts."is_error" = \'N\' '
+        'AND t."is_active" = \'Y\' '
+        'GROUP BY t."timekeeper_name" '
+        'ORDER BY underbilling_per_hour DESC '
+        'LIMIT 5;',
+        "Which timekeepers have the highest underbilling amount per hour in 2025?"
+    ),
+    (
+        'SELECT m."matter_name", COUNT(DISTINCT mts."tk_mat_sum_id") AS underbilled_entries '
+        'FROM "matter_timekeeper_summary" mts '
+        'JOIN "matter" m ON mts."matter_id" = m."matter_id" '
+        'WHERE mts."worked_amount" < mts."standard_amount" '
+        'AND mts."year" = 2025 '
+        'AND mts."is_error" = \'N\' '
+        'AND m."is_active" = \'Y\' '
+        'GROUP BY m."matter_name" '
+        'ORDER BY underbilled_entries DESC '
+        'LIMIT 5;',
+        "Which matters have the most underbilled entries in 2025?"
+    ),
+    (
+        'SELECT t."timekeeper_name", '
+        'ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY (tc."worked_rate" / NULLIF(tc."standard_rate", 0)))::numeric, 2) AS median_rate_ratio '
+        'FROM "timecard" tc '
+        'JOIN "timekeeper" t ON tc."timekeeper_id" = t."timekeeper_id" '
+        'WHERE EXTRACT(YEAR FROM tc."date") = 2025 '
+        'AND tc."is_active" = \'Y\' '
+        'AND tc."is_nonbillable" = \'N\' '
+        'AND t."is_active" = \'Y\' '
+        'GROUP BY t."timekeeper_name" '
+        'HAVING PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY (tc."worked_rate" / NULLIF(tc."standard_rate", 0))) < 0.9 '
+        'ORDER BY median_rate_ratio ASC;',
+        "Which timekeepers have a median worked-to-standard rate ratio below 90% in 2025?"
+    ),
+    (
+        'SELECT m."category", ROUND(AVG(mts."standard_amount" - mts."worked_amount")::numeric, 2) AS avg_underbilling '
+        'FROM "matter_timekeeper_summary" mts '
+        'JOIN "matter" m ON mts."matter_id" = m."matter_id" '
+        'WHERE mts."year" = 2025 '
+        'AND mts."is_error" = \'N\' '
+        'AND m."is_active" = \'Y\' '
+        'GROUP BY m."category" '
+        'ORDER BY avg_underbilling DESC;',
+        "Which matter categories have the highest average underbilling in 2025?"
+    ),
+    (
+        'SELECT c."client_name", '
+        'ROUND((SUM(CASE WHEN tc."is_nonbillable" = \'Y\' OR tc."is_no_charge" = \'Y\' THEN tc."worked_hours" ELSE 0 END) / NULLIF(SUM(tc."worked_hours"), 0) * 100)::numeric, 2) AS non_billed_percent '
+        'FROM "timecard" tc '
+        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE EXTRACT(YEAR FROM tc."date") = 2025 '
+        'AND tc."is_active" = \'Y\' '
+        'AND c."is_active" = \'Y\' '
+        'GROUP BY c."client_name" '
+        'HAVING SUM(CASE WHEN tc."is_nonbillable" = \'Y\' OR tc."is_no_charge" = \'Y\' THEN tc."worked_hours" ELSE 0 END) / NULLIF(SUM(tc."worked_hours"), 0) > 0.2 '
+        'ORDER BY non_billed_percent DESC;',
+        "Which clients have more than 20% of their hours as non-billable or no-charge in 2025?"
+    ),
+    (
+        'SELECT m."matter_name", '
+        'ROUND(SUM(CASE WHEN tc."worked_amount" < tc."standard_amount" THEN (tc."standard_amount" - tc."worked_amount") ELSE 0 END)::numeric, 2) AS underbilling_amount '
+        'FROM "timecard" tc '
+        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
+        'WHERE EXTRACT(YEAR FROM tc."date") = 2025 '
+        'AND tc."is_active" = \'Y\' '
+        'AND m."is_active" = \'Y\' '
+        'AND tc."is_nonbillable" = \'N\' '
+        'AND tc."is_no_charge" = \'N\' '
+        'GROUP BY m."matter_name" '
+        'ORDER BY underbilling_amount DESC '
+        'LIMIT 5;',
+        "Which matters have the highest underbilling amount for billable timecards in 2025?"
+    ),
+    # New Queries to Address Drawbacks
+    (
+        'SELECT EXTRACT(MONTH FROM tc."date") AS month, ROUND(SUM(tc."standard_amount" - tc."worked_amount")::numeric, 2) AS monthly_underbilling '
+        'FROM "timecard" tc '
+        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
+        'WHERE EXTRACT(YEAR FROM tc."date") = 2025 '
+        'AND tc."is_active" = \'Y\' '
+        'AND m."is_active" = \'Y\' '
+        'AND tc."is_nonbillable" = \'N\' '
+        'AND tc."is_no_charge" = \'N\' '
+        'GROUP BY EXTRACT(MONTH FROM tc."date") '
+        'ORDER BY month;',
+        "What is the monthly breakdown of underbilling amounts for billable timecards in 2025?"
+    ),
+    (
+        'SELECT m."matter_name", SUM(tc."worked_hours") AS total_hours '
+        'FROM "timecard" tc '
+        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
+        'WHERE m."is_flat_fees" = \'Y\' '
+        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
+        'AND tc."is_active" = \'Y\' '
+        'AND m."is_active" = \'Y\' '
+        'GROUP BY m."matter_name" '
+        'HAVING SUM(tc."worked_hours") > 100 '
+        'ORDER BY total_hours DESC '
+        'LIMIT 5;',
+        "Which flat-fee matters have more than 100 hours worked in 2025?"
+    ),
+    (
+        'SELECT m."matter_name", COUNT(tc."timecard_id") AS null_rate_timecards '
+        'FROM "timecard" tc '
+        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
+        'WHERE (tc."worked_rate" IS NULL OR tc."standard_rate" IS NULL) '
+        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
+        'AND tc."is_active" = \'Y\' '
+        'AND m."is_active" = \'Y\' '
+        'GROUP BY m."matter_name" '
+        'ORDER BY null_rate_timecards DESC;',
+        "Which matters have timecards with missing worked or standard rates in 2025?"
+    ),
+    (
+        'SELECT m."matter_name", COUNT(tc."timecard_id") AS currency_mismatch '
+        'FROM "timecard" tc '
+        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
+        'WHERE tc."standard_rate_currency" != m."matter_currency" '
+        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
+        'AND tc."is_active" = \'Y\' '
+        'AND m."is_active" = \'Y\' '
+        'GROUP BY m."matter_name" '
+        'ORDER BY currency_mismatch DESC;',
+        "Which matters have timecards with standard rate currency mismatches in 2025?"
+    ),
+    (
+        'SELECT rd."arrangement", ROUND(AVG(rd."deviation_amount")::numeric, 2) AS avg_discount '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        'AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        'AND m."is_active" = \'Y\' '
+        'GROUP BY rd."arrangement" '
+        'ORDER BY avg_discount DESC;',
+        "Which rate arrangements have the highest average discount amounts in 2025?"
+    ),
+    (
+        'SELECT t."timekeeper_name", '
+        'ROUND(SUM(tc."worked_hours" * t."cost_rate")::numeric, 2) AS total_cost '
+        'FROM "timecard" tc '
+        'JOIN "timekeeper" t ON tc."timekeeper_id" = t."timekeeper_id" '
+        'WHERE tc."is_nonbillable" = \'Y\' '
+        'AND EXTRACT(YEAR FROM tc."date") = 2025 '
+        'AND tc."is_active" = \'Y\' '
+        'AND t."is_active" = \'Y\' '
+        'GROUP BY t."timekeeper_name" '
+        'ORDER BY total_cost DESC '
+        'LIMIT 5;',
+        "Which timekeepers have the highest cost for non-billable hours in 2025?"
+    ),
+    (
+        'SELECT c."type" AS client_type, ROUND(SUM(mts."standard_amount" - mts."worked_amount")::numeric, 2) AS total_underbilling '
+        'FROM "matter_timekeeper_summary" mts '
+        'JOIN "matter" m ON mts."matter_id" = m."matter_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE mts."year" = 2025 '
+        'AND mts."is_error" = \'N\' '
+        'AND c."is_active" = \'Y\' '
+        'GROUP BY c."type" '
+        'ORDER BY total_underbilling DESC;',
+        "Which client types have the highest total underbilling in 2025?"
+    ),
+    (
+        'SELECT m."matter_name", '
+        'ROUND(STDDEV(tc."worked_rate" / NULLIF(tc."standard_rate", 0))::numeric, 2) AS rate_ratio_stddev '
+        'FROM "timecard" tc '
+        'JOIN "matter" m ON tc."matter_id" = m."matter_id" '
+        'WHERE EXTRACT(YEAR FROM tc."date") = 2025 '
+        'AND tc."is_active" = \'Y\' '
+        'AND m."is_active" = \'Y\' '
+        'AND tc."is_nonbillable" = \'N\' '
+        'GROUP BY m."matter_name" '
+        'HAVING STDDEV(tc."worked_rate" / NULLIF(tc."standard_rate", 0)) > 0.1 '
+        'ORDER BY rate_ratio_stddev DESC '
+        'LIMIT 5;',
+        "Which matters have the highest variability in worked-to-standard rate ratios in 2025?"
+    ),
+    (
+        'SELECT t."timekeeper_name", '
+        'ROUND(SUM(CASE WHEN tc."worked_amount" < tc."standard_amount" THEN (tc."standard_amount" - tc."worked_amount") ELSE 0 END)::numeric, 2) AS underbilling_2025, '
+        'ROUND(LAG(SUM(CASE WHEN tc."worked_amount" < tc."standard_amount" THEN (tc."standard_amount" - tc."worked_amount") ELSE 0 END)) OVER (PARTITION BY t."timekeeper_name" ORDER BY EXTRACT(YEAR FROM tc."date"))::numeric, 2) AS underbilling_2024 '
+        'FROM "timecard" tc '
+        'JOIN "timekeeper" t ON tc."timekeeper_id" = t."timekeeper_id" '
+        'WHERE EXTRACT(YEAR FROM tc."date") IN (2024, 2025) '
+        'AND tc."is_active" = \'Y\' '
+        'AND t."is_active" = \'Y\' '
+        'AND tc."is_nonbillable" = \'N\' '
+        'AND tc."is_no_charge" = \'N\' '
+        'GROUP BY t."timekeeper_name", EXTRACT(YEAR FROM tc."date") '
+        'HAVING EXTRACT(YEAR FROM tc."date") = 2025 '
+        'ORDER BY underbilling_2025 DESC '
+        'LIMIT 5;',
+        "Which timekeepers have the highest underbilling in 2025 compared to 2024?"
+    ),
+    (
+        'SELECT m."matter_name", COUNT(DISTINCT rd."rate_detail_id") AS missing_rate_details '
+        'FROM "matter" m '
+        'LEFT JOIN "rate_set" rs ON m."rate_set_id" = rs."rate_set_id" '
+        'LEFT JOIN "rate_set_link" rsl ON rs."rate_set_id" = rsl."rate_set_id" '
+        'LEFT JOIN "rate_detail" rd ON rsl."rate_component_id" = rd."rate_component_id" '
+        'WHERE EXTRACT(YEAR FROM rd."start_date") = 2025 '
+        'AND m."is_active" = \'Y\' '
+        'AND rd."rate_detail_id" IS NULL '
+        'GROUP BY m."matter_name" '
+        'ORDER BY missing_rate_details DESC '
+        'LIMIT 5;',
+        "Which matters lack corresponding rate details in 2025?"
+    )
+]
+
+underbilling_documentation = [
+    "Underbilling occurs when the billed amount (worked_amount) is less than the expected amount (standard_amount) in timecard or matter_timekeeper_summary, due to lower rates, discounts, non-billable hours, no-charge entries, or flat-fee arrangements.",
+    "In the timecard table, worked_amount is calculated using worked_rate, while standard_amount uses standard_rate. A worked_amount lower than standard_amount indicates underbilling.",
+    "The is_nonbillable = 'Y' flag in timecard marks hours that are not billed, contributing to underbilling by reducing revenue.",
+    "The is_no_charge = 'Y' flag in timecard indicates hours worked but not charged to the client, a direct form of underbilling.",
+    "In rate_detail, deviation_amount and deviation_percent quantify discounts applied to rates, reducing worked_amount and causing underbilling.",
+    "The matter_timekeeper_summary table aggregates worked_amount and standard_amount by timekeeper and matter, useful for calculating total or average underbilling.",
+    "The timekeeper table’s type column (e.g., Partner, Associate) helps analyze underbilling trends by role.",
+    "The matter table’s type and category columns categorize matters (e.g., Litigation, Corporate), enabling underbilling analysis by matter characteristics.",
+    "The client table’s client_name links to matters, allowing identification of clients with high underbilling.",
+    "Comparing worked_rate to standard_rate in timecard reveals rate reductions that lead to underbilling.",
+    "Data errors, such as worked_amount exceeding standard_amount or null worked_rate in timecard, can mask or cause underbilling and require investigation.",
+    "The rate_set, rate_set_link, and rate_component tables connect matters to rate structures, with rate_detail providing discount details via deviation_amount.",
+    "Realization rate (worked_amount / standard_amount * 100 or worked_rate / standard_rate * 100) in matter_timekeeper_summary or timecard indicates underbilling when below 100%.",
+    "Currency mismatches between worked_currency or standard_rate_currency in timecard and matter_currency in matter may cause billing errors, potentially leading to underbilling.",
+    "The is_active = 'Y' flag in timecard, matter, and client ensures analysis focuses on current, relevant data.",
+    "The is_error = 'N' flag in matter_timekeeper_summary filters out erroneous entries to ensure accurate underbilling calculations.",
+    "The is_flat_fees = 'Y' flag in matter or is_flat_fee = 'Y' in timecard indicates fixed-fee arrangements, where underbilling occurs if hours worked exceed expected value.",
+    "The timekeeper table’s cost_rate and cost_rate_currency allow cost-based underbilling analysis, e.g., non-billable hours’ financial impact.",
+    "The client table’s type column (e.g., Corporate, Individual) enables underbilling analysis by client characteristics.",
+    "The rate_detail table’s arrangement column categorizes billing arrangements, useful for analyzing discount patterns.",
+    "Statistical measures like standard deviation of worked_rate / standard_rate in timecard reveal variability in billing practices.",
+    "Year-over-year comparisons using timecard or matter_timekeeper_summary data identify trends in underbilling.",
+    "Missing rate_detail entries for matters indicate potential billing configuration errors, leading to underbilling."
+]
+
+ddl_statements = [
+    # timecard table
+    'Table: timecard - Column: timecard_id, Type: text, Nullable: YES - Column: timekeeper_id, Type: text, Nullable: YES - Column: matter_id, Type: text, Nullable: YES - Column: date, Type: timestamp without time zone, Nullable: YES - Column: time_type, Type: text, Nullable: YES - Column: is_flat_fee, Type: text, Nullable: YES - Column: is_nonbillable, Type: text, Nullable: YES - Column: is_no_charge, Type: text, Nullable: YES - Column: is_active, Type: text, Nullable: YES - Column: worked_hours, Type: double precision, Nullable: YES - Column: worked_rate, Type: bigint, Nullable: YES - Column: worked_amount, Type: bigint, Nullable: YES - Column: worked_currency, Type: text, Nullable: YES - Column: standard_rate, Type: bigint, Nullable: YES - Column: standard_amount, Type: bigint, Nullable: YES - Column: standard_rate_currency, Type: text, Nullable: YES',
+    'Adding ddl: CREATE TABLE timecard ("timecard_id" TEXT, "timekeeper_id" TEXT, "matter_id" TEXT, "date" TIMESTAMP WITHOUT TIME ZONE, "time_type" TEXT, "is_flat_fee" TEXT, "is_nonbillable" TEXT, "is_no_charge" TEXT, "is_active" TEXT, "worked_hours" DOUBLE PRECISION, "worked_rate" BIGINT, "worked_amount" BIGINT, "worked_currency" TEXT, "standard_rate" BIGINT, "standard_amount" BIGINT, "standard_rate_currency" TEXT);',
+
+    # matter_timekeeper_summary table
+    'Table: matter_timekeeper_summary - Column: tk_mat_sum_id, Type: text, Nullable: YES - Column: matter_id, Type: text, Nullable: YES - Column: timekeeper_id, Type: text, Nullable: YES - Column: year, Type: bigint, Nullable: YES - Column: worked_hours, Type: bigint, Nullable: YES - Column: worked_amount, Type: bigint, Nullable: YES - Column: standard_amount, Type: bigint, Nullable: YES - Column: currency, Type: text, Nullable: YES - Column: is_error, Type: text, Nullable: YES - Column: error_message, Type: double precision, Nullable: YES',
+    'Adding ddl: CREATE TABLE matter_timekeeper_summary ("tk_mat_sum_id" TEXT, "matter_id" TEXT, "timekeeper_id" TEXT, "year" BIGINT, "worked_hours" BIGINT, "worked_amount" BIGINT, "standard_amount" BIGINT, "currency" TEXT, "is_error" TEXT, "error_message" DOUBLE PRECISION);',
+
+    # timekeeper table
+    'Table: timekeeper - Column: timekeeper_id, Type: text, Nullable: YES - Column: timekeeper_number, Type: bigint, Nullable: YES - Column: timekeeper_name, Type: text, Nullable: YES - Column: timekeeper_sort_name, Type: text, Nullable: YES - Column: is_active, Type: text, Nullable: YES - Column: rate_year, Type: double precision, Nullable: YES - Column: type, Type: text, Nullable: YES - Column: attribute, Type: text, Nullable: YES - Column: category, Type: text, Nullable: YES - Column: budget_hours, Type: double precision, Nullable: YES - Column: cost_rate, Type: double precision, Nullable: YES - Column: cost_rate_currency, Type: text, Nullable: YES - Column: is_current, Type: text, Nullable: YES - Column: is_error, Type: text, Nullable: YES - Column: error_message, Type: text, Nullable: YES',
+    'Adding ddl: CREATE TABLE timekeeper ("timekeeper_id" TEXT, "timekeeper_number" BIGINT, "timekeeper_name" TEXT, "timekeeper_sort_name" TEXT, "is_active" TEXT, "rate_year" DOUBLE PRECISION, "type" TEXT, "attribute" TEXT, "category" TEXT, "budget_hours" DOUBLE PRECISION, "cost_rate" DOUBLE PRECISION, "cost_rate_currency" TEXT, "is_current" TEXT, "is_error" TEXT, "error_message" TEXT);',
+
+    # matter table
+    'Table: matter - Column: matter_id, Type: text, Nullable: YES - Column: matter_number, Type: text, Nullable: YES - Column: matter_name, Type: text, Nullable: YES - Column: client_id, Type: text, Nullable: YES - Column: related_matter_id, Type: text, Nullable: YES - Column: is_active, Type: text, Nullable: YES - Column: open_date, Type: timestamp without time zone, Nullable: YES - Column: matter_currency, Type: text, Nullable: YES - Column: rate_set_id, Type: text, Nullable: YES - Column: notification_days, Type: double precision, Nullable: YES - Column: rate_review_date, Type: timestamp without time zone, Nullable: YES - Column: billing_timekeeper_id, Type: text, Nullable: YES - Column: responsible_timekeeper_id, Type: text, Nullable: YES - Column: supervising_timekeeper_id, Type: text, Nullable: YES - Column: type, Type: text, Nullable: YES - Column: attribute, Type: text, Nullable: YES - Column: category, Type: text, Nullable: YES - Column: is_proforma_adjustments, Type: text, Nullable: YES - Column: is_flat_fees, Type: text, Nullable: YES - Column: is_ebilled, Type: text, Nullable: YES - Column: is_current, Type: text, Nullable: YES - Column: is_error, Type: text, Nullable: YES - Column: error_message, Type: double precision, Nullable: YES',
+    'Adding ddl: CREATE TABLE matter ("matter_id" TEXT, "matter_number" TEXT, "matter_name" TEXT, "client_id" TEXT, "related_matter_id" TEXT, "is_active" TEXT, "open_date" TIMESTAMP WITHOUT TIME ZONE, "matter_currency" TEXT, "rate_set_id" TEXT, "notification_days" DOUBLE PRECISION, "rate_review_date" TIMESTAMP WITHOUT TIME ZONE, "billing_timekeeper_id" TEXT, "responsible_timekeeper_id" TEXT, "supervising_timekeeper_id" TEXT, "type" TEXT, "attribute" TEXT, "category" TEXT, "is_proforma_adjustments" TEXT, "is_flat_fees" TEXT, "is_ebilled" TEXT, "is_current" TEXT, "is_error" TEXT, "error_message" DOUBLE PRECISION);',
+
+    # client table
+    'Table: client - Column: client_id, Type: text, Nullable: YES - Column: client_number, Type: bigint, Nullable: YES - Column: client_name, Type: text, Nullable: YES - Column: related_client_id, Type: text, Nullable: YES - Column: is_active, Type: text, Nullable: YES - Column: open_date, Type: timestamp without time zone, Nullable: YES - Column: rate_set_id, Type: text, Nullable: YES - Column: notification_days, Type: double precision, Nullable: YES - Column: rate_review_date, Type: timestamp without time zone, Nullable: YES - Column: year_end_month, Type: double precision, Nullable: YES - Column: type, Type: text, Nullable: YES - Column: attribute, Type: text, Nullable: YES - Column: category, Type: text, Nullable: YES - Column: relationship_timekeeper_id, Type: text, Nullable: YES - Column: is_proforma_adjustments, Type: text, Nullable: YES - Column: is_ebilled, Type: text, Nullable: YES - Column: is_current, Type: text, Nullable: YES - Column: is_error, Type: text, Nullable: YES - Column: error_message, Type: text, Nullable: YES',
+    'Adding ddl: CREATE TABLE client ("client_id" TEXT, "client_number" BIGINT, "client_name" TEXT, "related_client_id" TEXT, "is_active" TEXT, "open_date" TIMESTAMP WITHOUT TIME ZONE, "rate_set_id" TEXT, "notification_days" DOUBLE PRECISION, "rate_review_date" TIMESTAMP WITHOUT TIME ZONE, "year_end_month" DOUBLE PRECISION, "type" TEXT, "attribute" TEXT, "category" TEXT, "relationship_timekeeper_id" TEXT, "is_proforma_adjustments" TEXT, "is_ebilled" TEXT, "is_current" TEXT, "is_error" TEXT, "error_message" TEXT);',
+
+    # rate_set table
+    'Table: rate_set - Column: rate_set_id, Type: text, Nullable: YES - Column: rate_set_code, Type: text, Nullable: YES - Column: rate_set_name, Type: text, Nullable: YES',
+    'Adding ddl: CREATE TABLE rate_set ("rate_set_id" TEXT, "rate_set_code" TEXT, "rate_set_name" TEXT);',
+
+    # rate_set_link table
+    'Table: rate_set_link - Column: rate_set_link_id, Type: text, Nullable: YES - Column: rate_set_id, Type: text, Nullable: YES - Column: rate_component_id, Type: text, Nullable: YES - Column: rate_type, Type: text, Nullable: YES - Column: start_date, Type: double precision, Nullable: YES - Column: end_date, Type: double precision, Nullable: YES - Column: ordinal, Type: bigint, Nullable: YES',
+    'Adding ddl: CREATE TABLE rate_set_link ("rate_set_link_id" TEXT, "rate_set_id" TEXT, "rate_component_id" TEXT, "rate_type" TEXT, "start_date" DOUBLE PRECISION, "end_date" DOUBLE PRECISION, "ordinal" BIGINT);',
+
+    # rate_component table
+    'Table: rate_component - Column: rate_component_id, Type: text, Nullable: YES - Column: rate_type, Type: text, Nullable: YES - Column: rate_num, Type: bigint, Nullable: YES - Column: source_code, Type: text, Nullable: YES - Column: source_name, Type: text, Nullable: YES - Column: start_date, Type: timestamp without time zone, Nullable: YES - Column: end_date, Type: timestamp without time zone, Nullable: YES - Column: frozen_date, Type: timestamp without time zone, Nullable: YES - Column: is_step_up, Type: text, Nullable: YES - Column: is_skip_client_exceptions, Type: text, Nullable: YES - Column: default_rate_amount, Type: double precision, Nullable: YES - Column: default_currency, Type: text, Nullable: YES - Column: is_match_currency, Type: text, Nullable: YES - Column: is_error, Type: text, Nullable: YES - Column: error_message, Type: double precision, Nullable: YES',
+    'Adding ddl: CREATE TABLE rate_component ("rate_component_id" TEXT, "rate_type" TEXT, "rate_num" BIGINT, "source_code" TEXT, "source_name" TEXT, "start_date" TIMESTAMP WITHOUT TIME ZONE, "end_date" TIMESTAMP WITHOUT TIME ZONE, "frozen_date" TIMESTAMP WITHOUT TIME ZONE, "is_step_up" TEXT, "is_skip_client_exceptions" TEXT, "default_rate_amount" DOUBLE PRECISION, "default_currency" TEXT, "is_match_currency" TEXT, "is_error" TEXT, "error_message" DOUBLE PRECISION);',
+
+    # rate_detail table
+    'Table: rate_detail - Column: rate_detail_id, Type: text, Nullable: YES - Column: rate_component_id, Type: text, Nullable: YES - Column: is_virtual, Type: text, Nullable: YES - Column: start_date, Type: timestamp without time zone, Nullable: YES - Column: end_date, Type: timestamp without time zone, Nullable: YES - Column: ordinal, Type: bigint, Nullable: YES - Column: rate_id, Type: text, Nullable: YES - Column: rate_amount, Type: double precision, Nullable: YES - Column: deviation_amount, Type: double precision, Nullable: YES - Column: deviation_percent, Type: double precision, Nullable: YES - Column: rate_currency, Type: text, Nullable: YES - Column: rounding_method, Type: text, Nullable: YES - Column: matter_rate_min, Type: double precision, Nullable: YES - Column: matter_rate_max, Type: double precision, Nullable: YES - Column: timekeeper_id, Type: text, Nullable: YES - Column: title, Type: text, Nullable: YES - Column: officet, Type: text, Nullable: YES - Column: officem, Type: text, Nullable: YES - Column: rate_class, Type: text, Nullable: YES - Column: departmentt, Type: text, Nullable: YES - Column: departmentm, Type: text, Nullable: YES - Column: sectiont, Type: text, Nullable: YES - Column: sectionm, Type: text, Nullable: YES - Column: rate_year_min, Type: double precision, Nullable: YES - Column: rate_year_max, Type: double precision, Nullable: YES - Column: arrangement, Type: text, Nullable: YES - Column: practice_group, Type: text, Nullable: YES',
+    'Adding ddl: CREATE TABLE rate_detail ("rate_detail_id" TEXT, "rate_component_id" TEXT, "is_virtual" TEXT, "start_date" TIMESTAMP WITHOUT TIME ZONE, "end_date" TIMESTAMP WITHOUT TIME ZONE, "ordinal" BIGINT, "rate_id" TEXT, "rate_amount" DOUBLE PRECISION, "deviation_amount" DOUBLE PRECISION, "deviation_percent" DOUBLE PRECISION, "rate_currency" TEXT, "rounding_method" TEXT, "matter_rate_min" DOUBLE PRECISION, "matter_rate_max" DOUBLE PRECISION, "timekeeper_id" TEXT, "title" TEXT, "officet" TEXT, "officem" TEXT, "rate_class" TEXT, "departmentt" TEXT, "departmentm" TEXT, "sectiont" TEXT, "sectionm" TEXT, "rate_year_min" DOUBLE PRECISION, "rate_year_max" DOUBLE PRECISION, "arrangement" TEXT, "practice_group" TEXT);',
+]
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Underbilling CLI")
+    parser.add_argument("--json", action="store_true", help="Emit JSON output")
+    args = parser.parse_args()
+
+    config = {
+        'api_key': os.getenv('OPENAI_API_KEY'),
+        'model': os.getenv('MODEL_NAME', 'gpt-4o-mini'),
+        'embedding_model': 'text-embedding-3-small',
+        'allow_llm_to_see_data': True,
+    }
+
+    vn = MyVanna(config=config)
+
+    for sql, question in underbilling_sql_training:
+        vn.train(sql=sql, question=question)
+    for doc in underbilling_documentation:
+        vn.train(documentation=doc)
+    for ddl in ddl_statements:
+        vn.train(ddl=ddl)
+
+    vn.connect_to_postgres(
+        host=os.getenv("POSTGRES_HOST"),
+        dbname=os.getenv("POSTGRES_DB"),
+        user=os.getenv("UNDERBILLING_USER"),
+        password=os.getenv("UNDERBILLING_PASSWORD"),
+        port=int(os.getenv("POSTGRES_PORT", 5432))
+    )
+
+    print("Underbilling Agent ready. Type your question (or ‘quit’ to exit).")
+    while True:
+        question = input("\n> ").strip()
+        if not question or question.lower() in ("quit", "exit"):
+            break
+
+        result = vn.ask(question)
+        if not result:
+            print("No results returned.\n")
+            continue
+
+        df = result["df"]
+        chart_url = result["chart_url"]
+        summary = result["summary"]
+
+        if args.json:
+            print(json.dumps({
+                "data": df.head(100).to_dict(orient="records"),
+                "chart_url": chart_url,
+                "summary": summary
+            }, indent=2))
+        else:
+            print("\nRESULTS (top 10 rows):")
+            print(df.head(10).to_string(index=False))
+            if chart_url:
+                print(f"\nChart URL: {chart_url}")
+            print(f"\nSUMMARY:\n{summary}")
+
+    print("Goodbye!")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+________________________________________________________________________________________________________________________
+
+profitability_agent/cli.py
+
+#!/usr/bin/env python3
+import os
+import uuid
+import json
+import argparse
+import tempfile
+
+import pandas as pd
+from dotenv import load_dotenv
+
+import plotly.express as px
+import plotly.io as pio
+import plotly.basedatatypes as _bdt
+import plotly.graph_objects as go
+
+import openai
+from vanna.openai import OpenAI_Chat
+from vanna.chromadb import ChromaDB_VectorStore
+
+from decimal import Decimal
+
+# Prevent Plotly from auto‐opening a browser
+pio.renderers.default = "svg"
+_bdt.BaseFigure.show = lambda *args, **kwargs: None
+
+# Load .env
+load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+
+def summarize(question: str, records: list[dict]) -> str:
+    system_msg = (
+        "You are a data-analysis assistant. "
+        "When given a user’s question and a JSON array of row objects, "
+        "your task is to produce a concise, narrative summary: "
+        "focus on overall patterns, counts, and high-level insights rather than listing each row."
+    )
+    user_msg = (
+        f"Here is the user’s question: {question}\n\n"
+        f"Below are up to 100 rows of raw results:\n{json.dumps(records, indent=2)}"
+    )
+    resp = openai.chat.completions.create(
+        model="gpt-4.1-nano",
+        temperature=0.0,
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user",   "content": user_msg},
+        ]
+    )
+    return resp.choices[0].message.content.strip()
+
+def convert_decimals(obj):
+    """
+    Recursively convert Decimal objects → float so json.dumps() won't choke.
+    """
+    if isinstance(obj, list):
+        return [convert_decimals(v) for v in obj]
+    if isinstance(obj, dict):
+        return {k: convert_decimals(v) for k, v in obj.items()}
+    if isinstance(obj, Decimal):
+        return float(obj)
+    return obj
+
+
+class MyVanna(ChromaDB_VectorStore, OpenAI_Chat):
+    def __init__(self, config=None):
+        ChromaDB_VectorStore.__init__(self, config=config)
+        OpenAI_Chat.__init__(self, config=config)
+
+    def ask(self, question, **kwargs):
+        result = super().ask(question, **kwargs)
+        if result is None:
+            return None
+
+        df, fig = None, None
+        if isinstance(result, tuple):
+            if len(result) == 3 and isinstance(result[2], _bdt.BaseFigure):
+                _, df, fig = result
+            elif len(result) >= 2 and isinstance(result[1], pd.DataFrame):
+                _, df = result[0], result[1]
+            elif isinstance(result[0], pd.DataFrame):
+                df = result[0]
+        elif isinstance(result, pd.DataFrame):
+            df = result
+
+        if df is None or df.empty:
+            return None
+
+        html_str = None
+        if fig and isinstance(fig, (_bdt.BaseFigure, go.Figure)):
+            html_str = fig.to_html(include_plotlyjs="cdn")
+        elif len(df.columns) >= 2:
+            x, y = df.columns[:2]
+            fallback = px.bar(df.head(10), x=x, y=y, title=f"{y} by {x}")
+            html_str = fallback.to_html(include_plotlyjs="cdn")
+
+        chart_url = None
+        if html_str:
+            charts_dir = os.getenv("CHARTS_DIR", os.path.join(tempfile.gettempdir(), "underbilling_cli_charts"))
+            os.makedirs(charts_dir, exist_ok=True)
+            chart_filename = f"{uuid.uuid4()}.html"
+            chart_path = os.path.join(charts_dir, chart_filename)
+            with open(chart_path, "w", encoding="utf-8") as f:
+                f.write(html_str)
+            chart_url = f"http://127.0.0.1:8000/{chart_filename}"
+
+        records = df.head(100).copy()
+        for col in records.select_dtypes(include=["datetime64[ns]"]):
+            records[col] = records[col].dt.strftime("%Y-%m-%dT%H:%M:%S")
+            
+        data = convert_decimals(records.to_dict(orient="records"))
+
+        try:
+            summary = summarize(question, data)
+        except Exception as e:
+            summary = f"Could not generate summary: {e}"
+
+        return {
+            "df": df,
+            "chart_url": chart_url,
+            "summary": summary
+        }
+
+
+profitability_risks_sql_training = [
+    # Core Metric: Average Discount %
+    (
+        """
+        SELECT md.practice, ROUND(AVG(rd.deviation_percent * 100)::numeric, 2) AS avg_discount_percent
+        FROM matter_date md
+        JOIN matter m ON md.matter_id = m.matter_id
+        JOIN rate_set rs ON m.rate_set_id = rs.rate_set_id
+        JOIN rate_set_link rsl ON rs.rate_set_id = rsl.rate_set_id
+        JOIN rate_detail rd ON rsl.rate_component_id = rd.rate_component_id
+        WHERE md.start_date <= '2025-12-31'
+          AND (md.end_date >= '2025-01-01' OR md.end_date IS NULL)
+          AND rd.start_date <= '2025-12-31'
+          AND (rd.end_date >= '2025-01-01' OR rd.end_date IS NULL)
+          AND m.is_active = 'Y'
+        GROUP BY md.practice
+        ORDER BY avg_discount_percent DESC;
+        """,
+        "What is the average discount percentage for each practice area in 2025?"
+    ),
+    # Core Metric: Average Realization %
+    (
+        """
+        SELECT md.practice, ROUND(AVG(tc.worked_amount / NULLIF(tc.standard_amount, 0) * 100)::numeric, 2) AS avg_realization_percent
+        FROM timecard tc
+        JOIN matter m ON tc.matter_id = m.matter_id
+        JOIN matter_date md ON m.matter_id = md.matter_id
+        WHERE tc.date >= '2025-01-01'
+          AND tc.date < '2026-01-01'
+          AND tc.is_active = 'Y'
+          AND tc.is_nonbillable = 'N'
+          AND md.start_date <= tc.date
+          AND (md.end_date >= tc.date OR md.end_date IS NULL)
+          AND m.is_active = 'Y'
+        GROUP BY md.practice
+        ORDER BY avg_realization_percent ASC;
+        """,
+        "What is the average realization percentage for each practice area in 2025?"
+    ),
+    # Risk Detection: High Discounts
+    (
+        """
+        SELECT md.practice, ROUND(AVG(rd.deviation_percent * 100)::numeric, 2) AS avg_discount_percent
+        FROM matter_date md
+        JOIN matter m ON md.matter_id = m.matter_id
+        JOIN rate_set rs ON m.rate_set_id = rs.rate_set_id
+        JOIN rate_set_link rsl ON rs.rate_set_id = rsl.rate_set_id
+        JOIN rate_detail rd ON rsl.rate_component_id = rd.rate_component_id
+        WHERE md.start_date <= '2025-12-31'
+          AND (md.end_date >= '2025-01-01' OR md.end_date IS NULL)
+          AND rd.start_date <= '2025-12-31'
+          AND (rd.end_date >= '2025-01-01' OR rd.end_date IS NULL)
+          AND m.is_active = 'Y'
+        GROUP BY md.practice
+        HAVING AVG(rd.deviation_percent * 100) > 25
+        ORDER BY avg_discount_percent DESC;
+        """,
+        "Which practice areas have an average discount percentage greater than 25% in 2025?"
+    ),
+    # Risk Detection: Low Realization
+    (
+        """
+        SELECT md.practice, ROUND(AVG(tc.worked_amount / NULLIF(tc.standard_amount, 0) * 100)::numeric, 2) AS avg_realization_percent
+        FROM timecard tc
+        JOIN matter m ON tc.matter_id = m.matter_id
+        JOIN matter_date md ON m.matter_id = md.matter_id
+        WHERE tc.date >= '2025-01-01'
+          AND tc.date < '2026-01-01'
+          AND tc.is_active = 'Y'
+          AND tc.is_nonbillable = 'N'
+          AND md.start_date <= tc.date
+          AND (md.end_date >= tc.date OR md.end_date IS NULL)
+          AND m.is_active = 'Y'
+        GROUP BY md.practice
+        HAVING AVG(tc.worked_amount / NULLIF(tc.standard_amount, 0) * 100) < 80
+        ORDER BY avg_realization_percent ASC;
+        """,
+        "Which practice areas have an average realization percentage less than 80% in 2025?"
+    ),
+    # Comprehensive Summary
+    (
+        """
+        WITH practice_metrics AS (
+          SELECT md.practice,
+                 ROUND(AVG(rd.deviation_percent * 100)::numeric, 2) AS avg_discount_percent,
+                 ROUND(AVG(tc.worked_amount / NULLIF(tc.standard_amount, 0) * 100)::numeric, 2) AS avg_realization_percent
+          FROM matter_date md
+          JOIN matter m ON md.matter_id = m.matter_id
+          LEFT JOIN rate_set rs ON m.rate_set_id = rs.rate_set_id
+          LEFT JOIN rate_set_link rsl ON rs.rate_set_id = rsl.rate_set_id
+          LEFT JOIN rate_detail rd ON rsl.rate_component_id = rd.rate_component_id
+            AND rd.start_date <= '2025-12-31'
+            AND (rd.end_date >= '2025-01-01' OR rd.end_date IS NULL)
+          LEFT JOIN timecard tc ON m.matter_id = tc.matter_id
+            AND tc.date >= '2025-01-01'
+            AND tc.date < '2026-01-01'
+            AND tc.is_active = 'Y'
+            AND tc.is_nonbillable = 'N'
+            AND md.start_date <= tc.date
+            AND (md.end_date >= tc.date OR md.end_date IS NULL)
+          WHERE m.is_active = 'Y'
+            AND md.start_date <= '2025-12-31'
+            AND (md.end_date >= '2025-01-01' OR md.end_date IS NULL)
+          GROUP BY md.practice
+        )
+        SELECT practice,
+               avg_discount_percent,
+               avg_realization_percent,
+               CASE
+                 WHEN avg_discount_percent > 25 OR avg_realization_percent < 80 THEN 'At Risk'
+                 ELSE 'No Risk'
+               END AS risk_status,
+               CASE
+                 WHEN avg_discount_percent > 25 AND avg_realization_percent < 80 THEN 'Reduce discounting and revisit client negotiations'
+                 WHEN avg_discount_percent > 25 THEN 'Reduce discounting'
+                 WHEN avg_realization_percent < 80 THEN 'Revisit client negotiations'
+                 ELSE 'Maintain current practices'
+               END AS recommendation
+        FROM practice_metrics
+        ORDER BY practice;
+        """,
+        "Provide a summary of practice areas with their average discount percentage, realization percentage, risk status, and recommendation for 2025."
+    ),
+    # Trend Analysis: Discount Comparison
+    (
+        """
+        SELECT md.practice,
+               ROUND(AVG(rd.deviation_percent * 100)::numeric, 2) AS avg_discount_percent_2025,
+               (SELECT ROUND(AVG(rd2.deviation_percent * 100)::numeric, 2)
+                FROM rate_detail rd2
+                JOIN rate_set_link rsl2 ON rd2.rate_component_id = rsl2.rate_component_id
+                JOIN rate_set rs2 ON rsl2.rate_set_id = rs2.rate_set_id
+                JOIN matter m2 ON rs2.rate_set_id = m2.rate_set_id
+                JOIN matter_date md2 ON m2.matter_id = md2.matter_id
+                WHERE md2.practice = md.practice
+                  AND rd2.start_date <= '2024-12-31'
+                  AND (rd2.end_date >= '2024-01-01' OR rd2.end_date IS NULL)
+                  AND m2.is_active = 'Y') AS avg_discount_percent_2024
+        FROM matter_date md
+        JOIN matter m ON md.matter_id = m.matter_id
+        JOIN rate_set rs ON m.rate_set_id = rs.rate_set_id
+        JOIN rate_set_link rsl ON rs.rate_set_id = rsl.rate_set_id
+        JOIN rate_detail rd ON rsl.rate_component_id = rd.rate_component_id
+        WHERE md.start_date <= '2025-12-31'
+          AND (md.end_date >= '2025-01-01' OR md.end_date IS NULL)
+          AND rd.start_date <= '2025-12-31'
+          AND (rd.end_date >= '2025-01-01' OR rd.end_date IS NULL)
+          AND m.is_active = 'Y'
+        GROUP BY md.practice
+        ORDER BY avg_discount_percent_2025 DESC;
+        """,
+        "How do average discount percentages for practice areas in 2025 compare to 2024?"
+    ),
+    # Trend Analysis: Realization Comparison
+    (
+        """
+        SELECT md.practice,
+               ROUND(AVG(tc.worked_amount / NULLIF(tc.standard_amount, 0) * 100)::numeric, 2) AS avg_realization_percent_2025,
+               (SELECT ROUND(AVG(tc2.worked_amount / NULLIF(tc2.standard_amount, 0) * 100)::numeric, 2)
+                FROM timecard tc2
+                JOIN matter m2 ON tc2.matter_id = m2.matter_id
+                JOIN matter_date md2 ON m2.matter_id = md2.matter_id
+                WHERE md2.practice = md.practice
+                  AND tc2.date >= '2024-01-01'
+                  AND tc2.date < '2025-01-01'
+                  AND tc2.is_active = 'Y'
+                  AND tc2.is_nonbillable = 'N'
+                  AND md2.start_date <= tc2.date
+                  AND (md2.end_date >= tc2.date OR md2.end_date IS NULL)
+                  AND m2.is_active = 'Y') AS avg_realization_percent_2024
+        FROM timecard tc
+        JOIN matter m ON tc.matter_id = m.matter_id
+        JOIN matter_date md ON m.matter_id = md.matter_id
+        WHERE tc.date >= '2025-01-01'
+          AND tc.date < '2026-01-01'
+          AND tc.is_active = 'Y'
+          AND tc.is_nonbillable = 'N'
+          AND md.start_date <= tc.date
+          AND (md.end_date >= tc.date OR md.end_date IS NULL)
+          AND m.is_active = 'Y'
+        GROUP BY md.practice
+        ORDER BY avg_realization_percent_2025 ASC;
+        """,
+        "How do average realization percentages for practice areas in 2025 compare to 2024?"
+    ),
+    # Variability: Realization
+    (
+        """
+        SELECT md.practice, ROUND(STDDEV(tc.worked_amount / NULLIF(tc.standard_amount, 0) * 100)::numeric, 2) AS realization_variability
+        FROM timecard tc
+        JOIN matter m ON tc.matter_id = m.matter_id
+        JOIN matter_date md ON m.matter_id = m.matter_id
+        WHERE tc.date >= '2025-01-01'
+          AND tc.date < '2026-01-01'
+          AND tc.is_active = 'Y'
+          AND tc.is_nonbillable = 'N'
+          AND md.start_date <= tc.date
+          AND (md.end_date >= tc.date OR md.end_date IS NULL)
+          AND m.is_active = 'Y'
+        GROUP BY md.practice
+        ORDER BY realization_variability DESC;
+        """,
+        "Which practice areas have the highest variability in realization percentages in 2025?"
+    ),
+    # Variability: Discounts
+    (
+        """
+        SELECT md.practice, ROUND(STDDEV(rd.deviation_percent * 100)::numeric, 2) AS discount_variability
+        FROM matter_date md
+        JOIN matter m ON md.matter_id = m.matter_id
+        JOIN rate_set rs ON m.rate_set_id = rs.rate_set_id
+        JOIN rate_set_link rsl ON rs.rate_set_id = rsl.rate_set_id
+        JOIN rate_detail rd ON rsl.rate_component_id = rd.rate_component_id
+        WHERE md.start_date <= '2025-12-31'
+          AND (md.end_date >= '2025-01-01' OR md.end_date IS NULL)
+          AND rd.start_date <= '2025-12-31'
+          AND (rd.end_date >= '2025-01-01' OR rd.end_date IS NULL)
+          AND m.is_active = 'Y'
+        GROUP BY md.practice
+        ORDER BY discount_variability DESC;
+        """,
+        "Which practice areas have the highest variability in discount percentages in 2025?"
+    ),
+    # Client-Specific: Discounts
+    (
+        """
+        SELECT md.practice, c.client_name, ROUND(AVG(rd.deviation_percent * 100)::numeric, 2) AS avg_discount_percent
+        FROM matter_date md
+        JOIN matter m ON md.matter_id = m.matter_id
+        JOIN client c ON m.client_id = c.client_id
+        JOIN rate_set rs ON m.rate_set_id = rs.rate_set_id
+        JOIN rate_set_link rsl ON rs.rate_set_id = rsl.rate_set_id
+        JOIN rate_detail rd ON rsl.rate_component_id = rd.rate_component_id
+        WHERE md.start_date <= '2025-12-31'
+          AND (md.end_date >= '2025-01-01' OR md.end_date IS NULL)
+          AND rd.start_date <= '2025-12-31'
+          AND (rd.end_date >= '2025-01-01' OR rd.end_date IS NULL)
+          AND m.is_active = 'Y'
+          AND c.is_active = 'Y'
+        GROUP BY md.practice, c.client_name
+        HAVING AVG(rd.deviation_percent * 100) > 25
+        ORDER BY avg_discount_percent DESC;
+        """,
+        "Which clients within each practice area have average discount percentages greater than 25% in 2025?"
+    ),
+    # Client-Specific: Realization
+    (
+        """
+        SELECT md.practice, c.client_name, ROUND(AVG(tc.worked_amount / NULLIF(tc.standard_amount, 0) * 100)::numeric, 2) AS avg_realization_percent
+        FROM timecard tc
+        JOIN matter m ON tc.matter_id = m.matter_id
+        JOIN matter_date md ON m.matter_id = md.matter_id
+        JOIN client c ON m.client_id = c.client_id
+        WHERE tc.date >= '2025-01-01'
+          AND tc.date < '2026-01-01'
+          AND tc.is_active = 'Y'
+          AND tc.is_nonbillable = 'N'
+          AND md.start_date <= tc.date
+          AND (md.end_date >= tc.date OR md.end_date IS NULL)
+          AND m.is_active = 'Y'
+          AND c.is_active = 'Y'
+        GROUP BY md.practice, c.client_name
+        HAVING AVG(tc.worked_amount / NULLIF(tc.standard_amount, 0) * 100) < 80
+        ORDER BY avg_realization_percent ASC;
+        """,
+        "Which clients within each practice area have average realization percentages less than 80% in 2025?"
+    ),
+    # Additional Factor: Non-Billable Hours
+    (
+        """
+        SELECT md.practice,
+               ROUND((SUM(CASE WHEN tc.is_nonbillable = 'Y' THEN tc.worked_amount ELSE 0 END) / NULLIF(SUM(tc.worked_amount), 0) * 100)::numeric, 2) AS non_billable_percent
+        FROM timecard tc
+        JOIN matter m ON tc.matter_id = m.matter_id
+        JOIN matter_date md ON m.matter_id = md.matter_id
+        WHERE tc.date >= '2025-01-01'
+          AND tc.date < '2026-01-01'
+          AND tc.is_active = 'Y'
+          AND md.start_date <= tc.date
+          AND (md.end_date >= tc.date OR md.end_date IS NULL)
+          AND m.is_active = 'Y'
+        GROUP BY md.practice
+        ORDER BY non_billable_percent DESC;
+        """,
+        "Which practice areas have the highest percentage of non-billable amounts in 2025?"
+    ),
+    # Additional Factor: Underbilling
+    (
+        """
+        SELECT md.practice, ROUND(SUM(mts.standard_amount - mts.worked_amount)::numeric, 2) AS total_underbilling
+        FROM matter_timekeeper_summary mts
+        JOIN matter m ON mts.matter_id = m.matter_id
+        JOIN matter_date md ON m.matter_id = md.matter_id
+        WHERE mts.year = 2025
+          AND mts.is_error = 'N'
+          AND m.is_active = 'Y'
+          AND md.start_date <= '2025-12-31'
+          AND (md.end_date >= '2025-01-01' OR md.end_date IS NULL)
+        GROUP BY md.practice
+        ORDER BY total_underbilling DESC;
+        """,
+        "Which practice areas have the highest total underbilling amount in 2025?"
+    ),
+    # Additional Factor: Currency Mismatches
+    (
+        """
+        SELECT md.practice, COUNT(DISTINCT tc.timecard_id) AS currency_mismatch_count
+        FROM timecard tc
+        JOIN matter m ON tc.matter_id = m.matter_id
+        JOIN matter_date md ON m.matter_id = md.matter_id
+        WHERE tc.date >= '2025-01-01'
+          AND tc.date < '2026-01-01'
+          AND tc.is_active = 'Y'
+          AND tc.is_nonbillable = 'N'
+          AND md.start_date <= tc.date
+          AND (md.end_date >= tc.date OR md.end_date IS NULL)
+          AND m.is_active = 'Y'
+          AND tc.worked_amount IS NOT NULL
+          AND m.matter_currency != mts.currency
+        JOIN matter_timekeeper_summary mts ON m.matter_id = mts.matter_id
+        GROUP BY md.practice
+        ORDER BY currency_mismatch_count DESC;
+        """,
+        "Which practice areas have the most timecards with currency mismatches in 2025?"
+    ),
+    # Matter Type Analysis
+    (
+        """
+        SELECT md.practice, m.type, ROUND(AVG(tc.worked_amount / NULLIF(tc.standard_amount, 0) * 100)::numeric, 2) AS avg_realization_percent
+        FROM timecard tc
+        JOIN matter m ON tc.matter_id = m.matter_id
+        JOIN matter_date md ON m.matter_id = md.matter_id
+        WHERE tc.date >= '2025-01-01'
+          AND tc.date < '2026-01-01'
+          AND tc.is_active = 'Y'
+          AND tc.is_nonbillable = 'N'
+          AND md.start_date <= tc.date
+          AND (md.end_date >= tc.date OR md.end_date IS NULL)
+          AND m.is_active = 'Y'
+        GROUP BY md.practice, m.type
+        ORDER BY avg_realization_percent ASC;
+        """,
+        "What is the average realization percentage by practice area and matter type in 2025?"
+    ),
+    # Matter Category Analysis
+    (
+        """
+        SELECT md.practice, m.category, ROUND(AVG(rd.deviation_percent * 100)::numeric, 2) AS avg_discount_percent
+        FROM matter_date md
+        JOIN matter m ON md.matter_id = m.matter_id
+        JOIN rate_set rs ON m.rate_set_id = rs.rate_set_id
+        JOIN rate_set_link rsl ON rs.rate_set_id = rsl.rate_set_id
+        JOIN rate_detail rd ON rsl.rate_component_id = rd.rate_component_id
+        WHERE md.start_date <= '2025-12-31'
+          AND (md.end_date >= '2025-01-01' OR md.end_date IS NULL)
+          AND rd.start_date <= '2025-12-31'
+          AND (rd.end_date >= '2025-01-01' OR rd.end_date IS NULL)
+          AND m.is_active = 'Y'
+        GROUP BY md.practice, m.category
+        ORDER BY avg_discount_percent DESC;
+        """,
+        "What is the average discount percentage by practice area and matter category in 2025?"
+    ),
+    # Quarterly Breakdown
+    (
+        """
+        SELECT md.practice,
+               EXTRACT(QUARTER FROM tc.date) AS quarter,
+               ROUND(AVG(tc.worked_amount / NULLIF(tc.standard_amount, 0) * 100)::numeric, 2) AS avg_realization_percent
+        FROM timecard tc
+        JOIN matter m ON tc.matter_id = m.matter_id
+        JOIN matter_date md ON m.matter_id = md.matter_id
+        WHERE tc.date >= '2025-01-01'
+          AND tc.date < '2026-01-01'
+          AND tc.is_active = 'Y'
+          AND tc.is_nonbillable = 'N'
+          AND md.start_date <= tc.date
+          AND (md.end_date >= tc.date OR md.end_date IS NULL)
+          AND m.is_active = 'Y'
+        GROUP BY md.practice, EXTRACT(QUARTER FROM tc.date)
+        ORDER BY md.practice, quarter;
+        """,
+        "What is the average realization percentage by practice area and quarter in 2025?"
+    ),
+    # High-Risk Matter Count
+    (
+        """
+        WITH matter_risks AS (
+          SELECT md.practice, m.matter_id,
+                 AVG(rd.deviation_percent * 100) AS avg_discount_percent,
+                 AVG(tc.worked_amount / NULLIF(tc.standard_amount, 0) * 100) AS avg_realization_percent
+          FROM matter_date md
+          JOIN matter m ON md.matter_id = m.matter_id
+          LEFT JOIN rate_set rs ON m.rate_set_id = rs.rate_set_id
+          LEFT JOIN rate_set_link rsl ON rs.rate_set_id = rsl.rate_set_id
+          LEFT JOIN rate_detail rd ON rsl.rate_component_id = rd.rate_component_id
+            AND rd.start_date <= '2025-12-31'
+            AND (rd.end_date >= '2025-01-01' OR rd.end_date IS NULL)
+          LEFT JOIN timecard tc ON m.matter_id = tc.matter_id
+            AND tc.date >= '2025-01-01'
+            AND tc.date < '2026-01-01'
+            AND tc.is_active = 'Y'
+            AND tc.is_nonbillable = 'N'
+            AND md.start_date <= tc.date
+            AND (md.end_date >= tc.date OR md.end_date IS NULL)
+          WHERE m.is_active = 'Y'
+            AND md.start_date <= '2025-12-31'
+            AND (md.end_date >= '2025-01-01' OR md.end_date IS NULL)
+          GROUP BY md.practice, m.matter_id
+          HAVING AVG(rd.deviation_percent * 100) > 25 OR AVG(tc.worked_amount / NULLIF(tc.standard_amount, 0) * 100) < 80
+        )
+        SELECT practice, COUNT(DISTINCT matter_id) AS high_risk_matter_count
+        FROM matter_risks
+        GROUP BY practice
+        ORDER BY high_risk_matter_count DESC;
+        """,
+        "How many matters in each practice area are at risk due to high discounts or low realization in 2025?"
+    ),
+    # Error Detection
+    (
+        """
+        SELECT md.practice, COUNT(DISTINCT mts.tk_mat_sum_id) AS error_entries
+        FROM matter_timekeeper_summary mts
+        JOIN matter m ON mts.matter_id = m.matter_id
+        JOIN matter_date md ON m.matter_id = md.matter_id
+        WHERE mts.year = 2025
+          AND mts.is_error = 'Y'
+          AND m.is_active = 'Y'
+          AND md.start_date <= '2025-12-31'
+          AND (md.end_date >= '2025-01-01' OR md.end_date IS NULL)
+        GROUP BY md.practice
+        ORDER BY error_entries DESC;
+        """,
+        "Which practice areas have the most erroneous billing entries in 2025?"
+    ),
+    # Median Realization
+    (
+        """
+        SELECT md.practice,
+               ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY (tc.worked_amount / NULLIF(tc.standard_amount, 0) * 100))::numeric, 2) AS median_realization_percent
+        FROM timecard tc
+        JOIN matter m ON tc.matter_id = m.matter_id
+        JOIN matter_date md ON m.matter_id = md.matter_id
+        WHERE tc.date >= '2025-01-01'
+          AND tc.date < '2026-01-01'
+          AND tc.is_active = 'Y'
+          AND tc.is_nonbillable = 'N'
+          AND md.start_date <= tc.date
+          AND (md.end_date >= tc.date OR md.end_date IS NULL)
+          AND m.is_active = 'Y'
+        GROUP BY md.practice
+        ORDER BY median_realization_percent ASC;
+        """,
+        "What is the median realization percentage for each practice area in 2025?"
+    )
+]
+
+profitability_risks_documentation = [
+    "Profitability risks in practice areas stem from high discounts (rate_detail.deviation_percent), low realization percentages (timecard.worked_amount / standard_amount), high non-billable amounts (timecard.is_nonbillable = 'Y'), and billing errors (matter_timekeeper_summary.is_error), all reducing revenue.",
+    "The matter_date table’s practice column groups matters by practice area (e.g., Litigation, Corporate), with start_date and end_date ensuring accurate time-based analysis.",
+    "rate_detail.deviation_percent measures discounts as a percentage reduction from standard rates, impacting profitability when high (e.g., > 25%).",
+    "Realization percentage, calculated as (timecard.worked_amount / standard_amount * 100), shows how much of the standard billing is realized; values below 80% indicate significant profitability risks.",
+    "matter_timekeeper_summary provides aggregated worked_amount and standard_amount by matter and year, offering an alternative source for realization calculations, with is_error filtering out unreliable data.",
+    "Year-over-year comparisons (e.g., 2025 vs. 2024 discounts) reveal trends in discounting or realization, helping identify worsening profitability risks.",
+    "Variability in realization or discounts (using STDDEV) indicates inconsistent billing practices within a practice area, signaling operational or client-specific risks.",
+    "Client-specific analysis (client.client_name) within practice areas pinpoints clients driving high discounts or low realization, guiding targeted negotiations.",
+    "Non-billable amounts (timecard.is_nonbillable = 'Y') reduce billable revenue; high percentages in a practice area suggest inefficiencies or client-imposed constraints.",
+    "Underbilling (matter_timekeeper_summary.standard_amount - worked_amount) represents lost revenue potential, a direct profitability risk when significant.",
+    "Currency mismatches between timecard.worked_amount and matter.matter_currency or matter_timekeeper_summary.currency can lead to billing errors, affecting profitability.",
+    "Matter type (matter.type) and category (matter.category) provide additional granularity, revealing profitability risks within specific matter classifications.",
+    "Quarterly breakdowns of realization percentages identify seasonal or temporal profitability risks within practice areas.",
+    "Counting high-risk matters (based on discount > 25% or realization < 80%) quantifies the extent of profitability issues within each practice area.",
+    "Erroneous entries (matter_timekeeper_summary.is_error = 'Y') can skew profitability metrics and require correction to ensure accurate risk assessment.",
+    "Median realization percentages (using PERCENTILE_CONT) provide a robust measure of central tendency, less sensitive to outliers than averages.",
+    "The summary query integrates discount %, realization %, risk status, and recommendations, fulfilling the agent’s core requirement to flag and address profitability risks.",
+    "Recommendations like 'reduce discounting' or 'revisit client negotiations' are tailored to specific risks, enhancing actionable insights.",
+    "All queries filter for is_active = 'Y' (matter, timecard, client) to focus on current data, ensuring relevance to ongoing operations.",
+    "The agent’s inability to assess write-offs (due to missing write_off_amount) limits its scope but does not affect the accuracy of discount and realization-based risk detection."
+]
+
+profitability_risks_ddl_statements = [
+    # matter_date table
+    'Table: matter_date - Column: matter_id, Type: text, Nullable: YES - Column: practice, Type: text, Nullable: YES - Column: start_date, Type: timestamp without time zone, Nullable: YES - Column: end_date, Type: timestamp without time zone, Nullable: YES',
+    'Adding ddl: CREATE TABLE matter_date ("matter_id" TEXT, "practice" TEXT, "start_date" TIMESTAMP WITHOUT TIME ZONE, "end_date" TIMESTAMP WITHOUT TIME ZONE);',
+
+    # matter table
+    'Table: matter - Column: matter_id, Type: text, Nullable: YES - Column: client_id, Type: text, Nullable: YES - Column: is_active, Type: text, Nullable: YES - Column: matter_currency, Type: text, Nullable: YES - Column: type, Type: text, Nullable: YES - Column: category, Type: text, Nullable: YES',
+    'Adding ddl: CREATE TABLE matter ("matter_id" TEXT, "client_id" TEXT, "is_active" TEXT, "matter_currency" TEXT, "type" TEXT, "category" TEXT);',
+
+    # timecard table
+    'Table: timecard - Column: timecard_id, Type: text, Nullable: YES - Column: matter_id, Type: text, Nullable: YES - Column: date, Type: timestamp without time zone, Nullable: YES - Column: worked_amount, Type: bigint, Nullable: YES - Column: standard_amount, Type: bigint, Nullable: YES - Column: is_active, Type: text, Nullable: YES - Column: is_nonbillable, Type: text, Nullable: YES',
+    'Adding ddl: CREATE TABLE timecard ("timecard_id" TEXT, "matter_id" TEXT, "date" TIMESTAMP WITHOUT TIME ZONE, "worked_amount" BIGINT, "standard_amount" BIGINT, "is_active" TEXT, "is_nonbillable" TEXT);',
+
+    # matter_timekeeper_summary table
+    'Table: matter_timekeeper_summary - Column: tk_mat_sum_id, Type: text, Nullable: YES - Column: matter_id, Type: text, Nullable: YES - Column: year, Type: bigint, Nullable: YES - Column: worked_amount, Type: bigint, Nullable: YES - Column: standard_amount, Type: bigint, Nullable: YES - Column: currency, Type: text, Nullable: YES - Column: is_error, Type: text, Nullable: YES',
+    'Adding ddl: CREATE TABLE matter_timekeeper_summary ("tk_mat_sum_id" TEXT, "matter_id" TEXT, "year" BIGINT, "worked_amount" BIGINT, "standard_amount" BIGINT, "currency" TEXT, "is_error" TEXT);',
+
+    # rate_detail table
+    'Table: rate_detail - Column: rate_detail_id, Type: text, Nullable: YES - Column: rate_component_id, Type: text, Nullable: YES - Column: deviation_percent, Type: double precision, Nullable: YES - Column: start_date, Type: timestamp without time zone, Nullable: YES - Column: end_date, Type: timestamp without time zone, Nullable: YES',
+    'Adding ddl: CREATE TABLE rate_detail ("rate_detail_id" TEXT, "rate_component_id" TEXT, "deviation_percent" DOUBLE PRECISION, "start_date" TIMESTAMP WITHOUT TIME ZONE, "end_date" TIMESTAMP WITHOUT TIME ZONE);',
+
+    # rate_set_link table
+    'Table: rate_set_link - Column: rate_set_link_id, Type: text, Nullable: YES - Column: rate_set_id, Type: text, Nullable: YES - Column: rate_component_id, Type: text, Nullable: YES',
+    'Adding ddl: CREATE TABLE rate_set_link ("rate_set_link_id" TEXT, "rate_set_id" TEXT, "rate_component_id" TEXT);',
+
+    # rate_set table
+    'Table: rate_set - Column: rate_set_id, Type: text, Nullable: YES',
+    'Adding ddl: CREATE TABLE rate_set ("rate_set_id" TEXT);',
+
+    # client table
+    'Table: client - Column: client_id, Type: text, Nullable: YES - Column: client_name, Type: text, Nullable: YES - Column: is_active, Type: text, Nullable: YES',
+    'Adding ddl: CREATE TABLE client ("client_id" TEXT, "client_name" TEXT, "is_active" TEXT);'
+]
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Profitability CLI")
+    parser.add_argument("--json", action="store_true", help="Emit JSON output")
+    args = parser.parse_args()
+
+    config = {
+        'api_key': os.getenv('OPENAI_API_KEY'),
+        'model': os.getenv('MODEL_NAME', 'gpt-4o-mini'),
+        'embedding_model': 'text-embedding-3-small',
+        'allow_llm_to_see_data': True,
+    }
+
+    vn = MyVanna(config=config)
+
+    for sql, question in profitability_risks_sql_training:
+        vn.train(sql=sql, question=question)
+
+    for doc in profitability_risks_documentation:
+        vn.train(documentation=doc)
+
+    for ddl in profitability_risks_ddl_statements:
+        vn.train(ddl=ddl)
+
+    vn.connect_to_postgres(
+        host=os.getenv("POSTGRES_HOST"),
+        dbname=os.getenv("POSTGRES_DB"),
+        user=os.getenv("PROFITABILITY_USER"),
+        password=os.getenv("PROFITABILITY_PASSWORD"),
+        port=int(os.getenv("POSTGRES_PORT", 5432))
+    )
+
+    print("Profitability Agent ready. Type your question (or ‘quit’ to exit).")
+    while True:
+        question = input("\n> ").strip()
+        if not question or question.lower() in ("quit", "exit"):
+            break
+
+        result = vn.ask(question)
+        if not result:
+            print("No results returned.\n")
+            continue
+
+        df = result["df"]
+        chart_url = result["chart_url"]
+        summary = result["summary"]
+
+        if args.json:
+            print(json.dumps({
+                "data": convert_decimals(df.head(100).to_dict(orient="records")),
+                "chart_url": chart_url,
+                "summary": summary
+            }, indent=2))
+        else:
+            print("\nRESULTS (top 10 rows):")
+            print(df.head(10).to_string(index=False))
+            if chart_url:
+                print(f"\nChart URL: {chart_url}")
+            print(f"\nSUMMARY:\n{summary}")
+
+    print("Goodbye!")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+________________________________________________________________________________________________________________________
+
+cross_mtter_rate_consistency_agent/cli.py
+
+#!/usr/bin/env python3
+import os
+import uuid
+import json
+import argparse
+import tempfile
+
+import pandas as pd
+from dotenv import load_dotenv
+
+import plotly.express as px
+import plotly.io as pio
+import plotly.basedatatypes as _bdt
+import plotly.graph_objects as go
+
+import openai
+from vanna.openai import OpenAI_Chat
+from vanna.chromadb import ChromaDB_VectorStore
+
+# Prevent Plotly from auto‐opening a browser
+pio.renderers.default = "svg"
+_bdt.BaseFigure.show = lambda *args, **kwargs: None
+
+# Load .env
+load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+
+def summarize(question: str, records: list[dict]) -> str:
+    system_msg = (
+        "You are a data-analysis assistant. "
+        "When given a user’s question and a JSON array of row objects, "
+        "your task is to produce a concise, narrative summary: "
+        "focus on overall patterns, counts, and high-level insights rather than listing each row."
+    )
+    user_msg = (
+        f"Here is the user’s question: {question}\n\n"
+        f"Below are up to 100 rows of raw results:\n{json.dumps(records, indent=2)}"
+    )
+    resp = openai.chat.completions.create(
+        model="gpt-4.1-nano",
+        temperature=0.0,
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user",   "content": user_msg},
+        ]
+    )
+    return resp.choices[0].message.content.strip()
+
+
+class MyVanna(ChromaDB_VectorStore, OpenAI_Chat):
+    def __init__(self, config=None):
+        ChromaDB_VectorStore.__init__(self, config=config)
+        OpenAI_Chat.__init__(self, config=config)
+
+    def ask(self, question, **kwargs):
+        result = super().ask(question, **kwargs)
+        if result is None:
+            return None
+
+        df, fig = None, None
+        if isinstance(result, tuple):
+            if len(result) == 3 and isinstance(result[2], _bdt.BaseFigure):
+                _, df, fig = result
+            elif len(result) >= 2 and isinstance(result[1], pd.DataFrame):
+                _, df = result[0], result[1]
+            elif isinstance(result[0], pd.DataFrame):
+                df = result[0]
+        elif isinstance(result, pd.DataFrame):
+            df = result
+
+        if df is None or df.empty:
+            return None
+
+        html_str = None
+        if fig and isinstance(fig, (_bdt.BaseFigure, go.Figure)):
+            html_str = fig.to_html(include_plotlyjs="cdn")
+        elif len(df.columns) >= 2:
+            x, y = df.columns[:2]
+            fallback = px.bar(df.head(10), x=x, y=y, title=f"{y} by {x}")
+            html_str = fallback.to_html(include_plotlyjs="cdn")
+
+        chart_url = None
+        if html_str:
+            charts_dir = os.getenv("CHARTS_DIR", os.path.join(tempfile.gettempdir(), "underbilling_cli_charts"))
+            os.makedirs(charts_dir, exist_ok=True)
+            chart_filename = f"{uuid.uuid4()}.html"
+            chart_path = os.path.join(charts_dir, chart_filename)
+            with open(chart_path, "w", encoding="utf-8") as f:
+                f.write(html_str)
+            chart_url = f"http://127.0.0.1:8000/{chart_filename}"
+
+        records = df.head(100).copy()
+        for col in records.select_dtypes(include=["datetime64[ns]"]):
+            records[col] = records[col].dt.strftime("%Y-%m-%dT%H:%M:%S")
+        data = records.to_dict(orient="records")
+
+        try:
+            summary = summarize(question, data)
+        except Exception as e:
+            summary = f"Could not generate summary: {e}"
+
+        return {
+            "df": df,
+            "chart_url": chart_url,
+            "summary": summary
+        }
+
+
+cross_matter_rate_consistency_sql_training = [
+    (
+        'SELECT c."client_name", m."matter_name", ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rd."deviation_percent" > 0.20 '
+        'ORDER BY c."client_name", discount_percent DESC;',
+        "Which matters have discounts greater than 20% for active clients in 2025?"
+    ),
+    (
+        'SELECT c."client_name", ROUND(AVG((rd."deviation_percent" * 100)::numeric), 2) AS avg_discount_percent '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        'GROUP BY c."client_name" '
+        'ORDER BY avg_discount_percent DESC '
+        'LIMIT 5;',
+        "Which clients have the highest average discount percentage across their matters in 2025?"
+    ),
+    (
+        'WITH client_avg AS ('
+        '  SELECT m."client_id", AVG(rd."deviation_percent" * 100) AS avg_discount '
+        '  FROM "rate_detail" rd '
+        '  JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        '  JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        '  JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        '  JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        '  WHERE rd."start_date" <= \'2025-12-31\' '
+        '    AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '    AND m."is_active" = \'Y\' '
+        '  GROUP BY m."client_id" '
+        ') '
+        'SELECT c."client_name", m."matter_name", ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent, '
+        '       ROUND(ABS(rd."deviation_percent" * 100 - ca.avg_discount)::numeric, 2) AS deviation_from_avg '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'JOIN client_avg ca ON m."client_id" = ca."client_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND ABS(rd."deviation_percent" * 100 - ca.avg_discount) > 10 '
+        'ORDER BY deviation_from_avg DESC;',
+        "Which matters have discounts deviating by more than 10% from their client’s average discount in 2025?"
+    ),
+    (
+        'SELECT rd."practice_group", ROUND(AVG((rd."deviation_percent" * 100)::numeric), 2) AS avg_discount_percent '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        'GROUP BY rd."practice_group" '
+        'ORDER BY avg_discount_percent DESC;',
+        "Which practice areas have the highest average discount percentage in 2025?"
+    ),
+    (
+        'SELECT c."client_name", rd."practice_group", m."matter_name", ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rd."deviation_percent" < 0.05 '
+        'ORDER BY c."client_name", rd."practice_group", discount_percent;',
+        "Which matters have discounts below 5% for active clients, grouped by practice area in 2025?"
+    ),
+    (
+        'WITH practice_avg AS ('
+        '  SELECT rd."practice_group", AVG(rd."deviation_percent" * 100) AS avg_discount '
+        '  FROM "rate_detail" rd '
+        '  JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        '  JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        '  JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        '  JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        '  WHERE rd."start_date" <= \'2025-12-31\' '
+        '    AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '    AND m."is_active" = \'Y\' '
+        '  GROUP BY rd."practice_group" '
+        ') '
+        'SELECT c."client_name", rd."practice_group", m."matter_name", '
+        '       ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent, '
+        '       ROUND(ABS(rd."deviation_percent" * 100 - pa.avg_discount)::numeric, 2) AS deviation_from_practice_avg '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'JOIN practice_avg pa ON rd."practice_group" = pa."practice_group" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND ABS(rd."deviation_percent" * 100 - pa.avg_discount) > 15 '
+        'ORDER BY deviation_from_practice_avg DESC;',
+        "Which matters have discounts deviating by more than 15% from their practice area’s average in 2025?"
+    ),
+    (
+        'SELECT c."client_name", COUNT(DISTINCT m."matter_id") AS matter_count, '
+        '       ROUND(AVG((rd."deviation_percent" * 100)::numeric), 2) AS avg_discount_percent '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        'GROUP BY c."client_name" '
+        'HAVING COUNT(DISTINCT m."matter_id") > 5 '
+        'ORDER BY avg_discount_percent DESC;',
+        "Which clients with more than 5 active matters have the highest average discount in 2025?"
+    ),
+    (
+        'SELECT c."client_name", m."matter_name", rd."rate_currency" '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rd."rate_currency" != ('
+        '    SELECT MODE() WITHIN GROUP (ORDER BY rd2."rate_currency") '
+        '    FROM "rate_detail" rd2 '
+        '    JOIN "rate_component" rc2 ON rd2."rate_component_id" = rc2."rate_component_id" '
+        '    JOIN "rate_set_link" rsl2 ON rc2."rate_component_id" = rsl2."rate_component_id" '
+        '    JOIN "rate_set" rs2 ON rsl2."rate_set_id" = rs2."rate_set_id" '
+        '    JOIN "matter" m2 ON rs2."rate_set_id" = m2."rate_set_id" '
+        '    WHERE m2."client_id" = m."client_id" '
+        '      AND rd2."start_date" <= \'2025-12-31\' '
+        '      AND (rd2."end_date" >= \'2025-01-01\' OR rd2."end_date" IS NULL) '
+        '      AND m2."is_active" = \'Y\' '
+        '  ) '
+        'ORDER BY c."client_name", m."matter_name";',
+        "Which matters have rate currencies different from their client’s most common currency in 2025?"
+    ),
+    (
+        'SELECT rd."practice_group", COUNT(DISTINCT m."matter_id") AS matter_count, '
+        '       ROUND(STDDEV((rd."deviation_percent" * 100)::numeric), 2) AS discount_variability '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        'GROUP BY rd."practice_group" '
+        'HAVING STDDEV(rd."deviation_percent" * 100) > 5 '
+        'ORDER BY discount_variability DESC;',
+        "Which practice areas have the highest variability in discount percentages in 2025?"
+    ),
+    (
+        'SELECT c."client_name", m."matter_name", rs."rate_set_name", '
+        '       ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rs."rate_set_name" != ('
+        '    SELECT MODE() WITHIN GROUP (ORDER BY rs2."rate_set_name") '
+        '    FROM "rate_set" rs2 '
+        '    JOIN "matter" m2 ON rs2."rate_set_id" = m2."rate_set_id" '
+        '    WHERE m2."client_id" = m."client_id" '
+        '      AND m2."is_active" = \'Y\' '
+        '  ) '
+        'ORDER BY c."client_name", discount_percent DESC;',
+        "Which matters use a different rate set than their client’s most common rate set in 2025?"
+    ),
+    (
+        'WITH client_practice_avg AS ('
+        '  SELECT m."client_id", rd."practice_group", AVG(rd."deviation_percent" * 100) AS avg_discount '
+        '  FROM "rate_detail" rd '
+        '  JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        '  JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        '  JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        '  JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        '  WHERE rd."start_date" <= \'2025-12-31\' '
+        '    AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '    AND m."is_active" = \'Y\' '
+        '  GROUP BY m."client_id", rd."practice_group" '
+        ') '
+        'SELECT c."client_name", rd."practice_group", m."matter_name", '
+        '       ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent, '
+        '       ROUND(ABS(rd."deviation_percent" * 100 - cpa.avg_discount)::numeric, 2) AS deviation_from_avg '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'JOIN client_practice_avg cpa ON m."client_id" = cpa."client_id" '
+        '                       AND rd."practice_group" = cpa."practice_group" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND ABS(rd."deviation_percent" * 100 - cpa.avg_discount) > 10 '
+        'ORDER BY deviation_from_avg DESC;',
+        "Which matters have discounts deviating by more than 10% from their client’s practice area average in 2025?"
+    ),
+    (
+        'SELECT c."client_name", COUNT(DISTINCT rd."practice_group") AS practice_group_count, '
+        '       ROUND(AVG((rd."deviation_percent" * 100)::numeric), 2) AS avg_discount_percent '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        'GROUP BY c."client_name" '
+        'HAVING COUNT(DISTINCT rd."practice_group") > 2 '
+        'ORDER BY avg_discount_percent DESC;',
+        "Which clients with matters in more than 2 practice areas have the highest average discount in 2025?"
+    ),
+    (
+        'SELECT rd."practice_group", c."client_name", m."matter_name", '
+        '       ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rd."deviation_percent" > 0.30 '
+        'ORDER BY rd."practice_group", discount_percent DESC;',
+        "Which matters in each practice area have discounts above 30% in 2025?"
+    ),
+    (
+        'SELECT c."client_name", m."matter_number", m."matter_name", '
+        '       ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rd."deviation_percent" = 0 '
+        'ORDER BY c."client_name", m."matter_number";',
+        "Which matters have no discounts applied for active clients in 2025?"
+    ),
+    (
+        'SELECT rd."practice_group", '
+        '       ROUND(MIN((rd."deviation_percent" * 100)::numeric), 2) AS min_discount, '
+        '       ROUND(MAX((rd."deviation_percent" * 100)::numeric), 2) AS max_discount '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        'GROUP BY rd."practice_group" '
+        'ORDER BY max_discount DESC;',
+        "What are the minimum and maximum discount percentages for each practice area in 2025?"
+    ),
+    (
+        'WITH client_discount_rank AS ('
+        '  SELECT c."client_name", m."matter_name", rd."deviation_percent" * 100 AS discount_percent, '
+        '         RANK() OVER (PARTITION BY m."client_id" ORDER BY rd."deviation_percent" DESC) AS discount_rank '
+        '  FROM "rate_detail" rd '
+        '  JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        '  JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        '  JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        '  JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        '  JOIN "client" c ON m."client_id" = c."client_id" '
+        '  WHERE rd."start_date" <= \'2025-12-31\' '
+        '    AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '    AND m."is_active" = \'Y\' '
+        '    AND c."is_active" = \'Y\' '
+        ') '
+        'SELECT client_name, matter_name, ROUND(discount_percent::numeric, 2) AS discount_percent '
+        'FROM client_discount_rank '
+        'WHERE discount_rank = 1 '
+        'ORDER BY discount_percent DESC;',
+        "Which matter has the highest discount for each client in 2025?"
+    ),
+    (
+        'SELECT c."client_name", rd."practice_group", '
+        '       ROUND(STDDEV((rd."deviation_percent" * 100)::numeric), 2) AS discount_variability '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        'GROUP BY c."client_name", rd."practice_group" '
+        'HAVING STDDEV(rd."deviation_percent" * 100) > 7 '
+        'ORDER BY discount_variability DESC;',
+        "Which clients have high discount variability (>7%) within practice areas in 2025?"
+    ),
+    (
+        'SELECT c."client_name", m."matter_name", rd."practice_group", '
+        '       ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rd."deviation_percent" > ('
+        '    SELECT AVG(rd2."deviation_percent") + 0.10 '
+        '    FROM "rate_detail" rd2 '
+        '    JOIN "rate_component" rc2 ON rd2."rate_component_id" = rc2."rate_component_id" '
+        '    JOIN "rate_set_link" rsl2 ON rc2."rate_component_id" = rsl2."rate_component_id" '
+        '    JOIN "rate_set" rs2 ON rsl2."rate_set_id" = rs2."rate_set_id" '
+        '    JOIN "matter" m2 ON rs2."rate_set_id" = m2."rate_set_id" '
+        '    WHERE m2."client_id" = m."client_id" '
+        '      AND rd2."start_date" <= \'2025-12-31\' '
+        '      AND (rd2."end_date" >= \'2025-01-01\' OR rd2."end_date" IS NULL) '
+        '      AND m2."is_active" = \'Y\' '
+        '  ) '
+        'ORDER BY discount_percent DESC;',
+        "Which matters have discounts more than 10% above their client’s average discount in 2025?"
+    ),
+    (
+        'SELECT rd."practice_group", COUNT(DISTINCT c."client_id") AS client_count, '
+        '       ROUND(AVG((rd."deviation_percent" * 100)::numeric), 2) AS avg_discount_percent '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        'GROUP BY rd."practice_group" '
+        'HAVING COUNT(DISTINCT c."client_id") > 3 '
+        'ORDER BY avg_discount_percent DESC;',
+        "Which practice areas serve more than 3 clients and have the highest average discount in 2025?"
+    ),
+    (
+        'SELECT c."client_name", m."matter_name", rd."practice_group", '
+        '       ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rd."deviation_percent" < ('
+        '    SELECT AVG(rd2."deviation_percent") - 0.10 '
+        '    FROM "rate_detail" rd2 '
+        '    JOIN "rate_component" rc2 ON rd2."rate_component_id" = rc2."rate_component_id" '
+        '    JOIN "rate_set_link" rsl2 ON rc2."rate_component_id" = rsl2."rate_component_id" '
+        '    JOIN "rate_set" rs2 ON rsl2."rate_set_id" = rs2."rate_set_id" '
+        '    JOIN "matter" m2 ON rs2."rate_set_id" = m2."rate_set_id" '
+        '    WHERE m2."client_id" = m."client_id" '
+        '      AND rd2."start_date" <= \'2025-12-31\' '
+        '      AND (rd2."end_date" >= \'2025-01-01\' OR rd2."end_date" IS NULL) '
+        '      AND m2."is_active" = \'Y\' '
+        '  ) '
+        'ORDER BY discount_percent ASC;',
+        "Which matters have discounts more than 10% below their client’s average discount in 2025?"
+    ),
+    (
+        'SELECT c."client_name", rd."practice_group", m."matter_name", '
+        '       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY rd."deviation_percent" * 100)::numeric, 2) AS median_discount '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        'GROUP BY c."client_name", rd."practice_group", m."matter_name" '
+        'HAVING PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY rd."deviation_percent" * 100) > 25 '
+        'ORDER BY median_discount DESC;',
+        "Which matters have a median discount above 25% within their client and practice area in 2025?"
+    ),
+    (
+        'SELECT c."client_name", m."matter_name", rd."practice_group", '
+        '       ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent, '
+        '       rs."rate_set_code" '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rsl."start_date" <= EXTRACT(EPOCH FROM \'2025-12-31\'::TIMESTAMP) '
+        '  AND (rsl."end_date" >= EXTRACT(EPOCH FROM \'2025-01-01\'::TIMESTAMP) OR rsl."end_date" IS NULL) '
+        '  AND rd."deviation_percent" > 0.25 '
+        'ORDER BY c."client_name", rd."practice_group", discount_percent DESC;',
+        "Which matters with active rate set links have discounts above 25% in 2025?"
+    ),
+    (
+        'SELECT rd."practice_group", c."client_name", COUNT(DISTINCT m."matter_id") AS matter_count '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rd."deviation_percent" > 0.20 '
+        'GROUP BY rd."practice_group", c."client_name" '
+        'HAVING COUNT(DISTINCT m."matter_id") > 2 '
+        'ORDER BY matter_count DESC;',
+        "Which clients have more than 2 matters with discounts above 20% in each practice area in 2025?"
+    ),
+    (
+        'WITH client_discount_stats AS ('
+        '  SELECT m."client_id", '
+        '         AVG(rd."deviation_percent" * 100) AS avg_discount, '
+        '         STDDEV(rd."deviation_percent" * 100) AS stddev_discount '
+        '  FROM "rate_detail" rd '
+        '  JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        '  JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        '  JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        '  JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        '  WHERE rd."start_date" <= \'2025-12-31\' '
+        '    AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '    AND m."is_active" = \'Y\' '
+        '  GROUP BY m."client_id" '
+        ') '
+        'SELECT c."client_name", m."matter_name", rd."practice_group", '
+        '       ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent, '
+        '       ROUND((rd."deviation_percent" * 100 - cds.avg_discount) / NULLIF(cds.stddev_discount, 0)::numeric, 2) AS z_score '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'JOIN client_discount_stats cds ON m."client_id" = cds."client_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND ABS((rd."deviation_percent" * 100 - cds.avg_discount) / NULLIF(cds.stddev_discount, 0)) > 2 '
+        'ORDER BY z_score DESC;',
+        "Which matters have discounts statistically significant (z-score > 2) from their client’s average in 2025?"
+    ),
+    (
+        'SELECT c."client_name", m."matter_name", rd."practice_group", '
+        '       ROUND((rd."deviation_percent" * 100)::numeric, 2) AS discount_percent '
+        'FROM "rate_detail" rd '
+        'JOIN "rate_component" rc ON rd."rate_component_id" = rc."rate_component_id" '
+        'JOIN "rate_set_link" rsl ON rc."rate_component_id" = rsl."rate_component_id" '
+        'JOIN "rate_set" rs ON rsl."rate_set_id" = rs."rate_set_id" '
+        'JOIN "matter" m ON rs."rate_set_id" = m."rate_set_id" '
+        'JOIN "client" c ON m."client_id" = c."client_id" '
+        'WHERE rd."start_date" <= \'2025-12-31\' '
+        '  AND (rd."end_date" >= \'2025-01-01\' OR rd."end_date" IS NULL) '
+        '  AND m."is_active" = \'Y\' '
+        '  AND c."is_active" = \'Y\' '
+        '  AND rc."start_date" <= \'2025-12-31\' '
+        '  AND (rc."end_date" >= \'2025-01-01\' OR rc."end_date" IS NULL) '
+        '  AND rd."deviation_percent" > 0.15 '
+        'ORDER BY c."client_name", rd."practice_group", discount_percent DESC;',
+        "Which matters with active rate components have discounts above 15% in 2025?"
+    )
+]
+
+cross_matter_rate_consistency_documentation = [
+    "The Cross-Matter Rate Consistency Agent identifies inconsistencies in discount percentages (deviation_percent) across matters for the same client, flagging matters where discounts deviate by more than 10% from the client’s average to ensure consistent billing practices.",
+    "In rate_detail, deviation_percent represents the discount applied to a matter’s rate, expressed as a decimal (e.g., 0.15 for 15%), which is critical for comparing rate consistency.",
+    "The rate_detail table links to matter via rate_component, rate_set_link, and rate_set, using rate_component_id and rate_set_id to trace discounts to specific matters.",
+    "The practice_group column in rate_detail categorizes matters by practice area (e.g., Litigation, Corporate), enabling analysis of discount consistency and profitability risks by practice area.",
+    "High discounts in certain practice areas may pose profitability risks, especially in high-margin areas, which the agent assesses by comparing deviation_percent across practice_group.",
+    "The client table’s client_name and client_id link to matters, allowing grouping of matters by client for discount comparison.",
+    "The matter table’s matter_name, matter_number, and client_id provide context for reporting outlier matters with inconsistent discounts.",
+    "The is_active = 'Y' flag in client and matter ensures analysis focuses on current clients and matters, relevant for 2025 data.",
+    "The start_date and end_date in rate_detail, rate_component, and rate_set_link filter for active rates in 2025, ensuring temporal relevance.",
+    "The rate_currency in rate_detail helps identify currency inconsistencies across a client’s matters, which could affect discount comparisons.",
+    "The rate_set table’s rate_set_code and rate_set_name provide context for the rate structures applied to matters, useful for diagnosing discount outliers.",
+    "Discount variability (e.g., standard deviation of deviation_percent) within a client or practice_group indicates inconsistent billing practices, potentially impacting profitability.",
+    "Statistical measures like z-scores or percentiles of deviation_percent help identify significant discount outliers for a client, enhancing outlier detection.",
+    "Comparing a matter’s deviation_percent to its practice_group’s average discount reveals practice-area-specific inconsistencies, critical for profitability analysis.",
+    "The agent recommends aligning discounts for outlier matters unless unique reasons (e.g., strategic client relationships) are identified, using matter_name and client_name for reporting."
+]
+
+
+cross_matter_rate_consistency_ddl_statements = [
+    # rate_detail table
+    'Table: rate_detail - Column: rate_detail_id, Type: text, Nullable: YES - Column: rate_component_id, Type: text, Nullable: YES - Column: start_date, Type: timestamp without time zone, Nullable: YES - Column: end_date, Type: timestamp without time zone, Nullable: YES - Column: deviation_percent, Type: double precision, Nullable: YES - Column: rate_currency, Type: text, Nullable: YES - Column: practice_group, Type: text, Nullable: YES',
+    'Adding ddl: CREATE TABLE rate_detail ("rate_detail_id" TEXT, "rate_component_id" TEXT, "start_date" TIMESTAMP WITHOUT TIME ZONE, "end_date" TIMESTAMP WITHOUT TIME ZONE, "deviation_percent" DOUBLE PRECISION, "rate_currency" TEXT, "practice_group" TEXT);',
+
+    # rate_component table
+    'Table: rate_component - Column: rate_component_id, Type: text, Nullable: YES - Column: start_date, Type: timestamp without time zone, Nullable: YES - Column: end_date, Type: timestamp without time zone, Nullable: YES',
+    'Adding ddl: CREATE TABLE rate_component ("rate_component_id" TEXT, "start_date" TIMESTAMP WITHOUT TIME ZONE, "end_date" TIMESTAMP WITHOUT TIME ZONE);',
+
+    # rate_set_link table
+    'Table: rate_set_link - Column: rate_set_link_id, Type: text, Nullable: YES - Column: rate_set_id, Type: text, Nullable: YES - Column: rate_component_id, Type: text, Nullable: YES - Column: start_date, Type: double precision, Nullable: YES - Column: end_date, Type: double precision, Nullable: YES',
+    'Adding ddl: CREATE TABLE rate_set_link ("rate_set_link_id" TEXT, "rate_set_id" TEXT, "rate_component_id" TEXT, "start_date" DOUBLE PRECISION, "end_date" DOUBLE PRECISION);',
+
+    # rate_set table
+    'Table: rate_set - Column: rate_set_id, Type: text, Nullable: YES - Column: rate_set_code, Type: text, Nullable: YES - Column: rate_set_name, Type: text, Nullable: YES',
+    'Adding ddl: CREATE TABLE rate_set ("rate_set_id" TEXT, "rate_set_code" TEXT, "rate_set_name" TEXT);',
+
+    # matter table
+    'Table: matter - Column: matter_id, Type: text, Nullable: YES - Column: matter_number, Type: text, Nullable: YES - Column: matter_name, Type: text, Nullable: YES - Column: client_id, Type: text, Nullable: YES - Column: is_active, Type: text, Nullable: YES - Column: rate_set_id, Type: text, Nullable: YES',
+    'Adding ddl: CREATE TABLE matter ("matter_id" TEXT, "matter_number" TEXT, "matter_name" TEXT, "client_id" TEXT, "is_active" TEXT, "rate_set_id" TEXT);',
+
+    # client table
+    'Table: client - Column: client_id, Type: text, Nullable: YES - Column: client_name, Type: text, Nullable: YES - Column: is_active, Type: text, Nullable: YES',
+    'Adding ddl: CREATE TABLE client ("client_id" TEXT, "client_name" TEXT, "is_active" TEXT);'
+]
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Cross Matter Rate Consistency CLI")
+    parser.add_argument("--json", action="store_true", help="Emit JSON output")
+    args = parser.parse_args()
+
+    config = {
+        'api_key': os.getenv('OPENAI_API_KEY'),
+        'model': os.getenv('MODEL_NAME', 'gpt-4o-mini'),
+        'embedding_model': 'text-embedding-3-small',
+        'allow_llm_to_see_data': True,
+    }
+
+    vn = MyVanna(config=config)
+
+    for sql, question in cross_matter_rate_consistency_sql_training:
+        vn.train(sql=sql, question=question)
+
+    for doc in cross_matter_rate_consistency_documentation:
+        vn.train(documentation=doc)
+
+    for ddl in cross_matter_rate_consistency_ddl_statements:
+        vn.train(ddl=ddl)
+
+    vn.connect_to_postgres(
+        host=os.getenv("POSTGRES_HOST"),
+        dbname=os.getenv("POSTGRES_DB"),
+        user=os.getenv("CROSS_MATTER_AGENT_USER"),
+        password=os.getenv("CROSS_MATTER_AGENT_PASSWORD"),
+        port=int(os.getenv("POSTGRES_PORT", 5432))
+    )
+
+    print("Cross Matter Rate Consistency Agent ready. Type your question (or ‘quit’ to exit).")
+    while True:
+        question = input("\n> ").strip()
+        if not question or question.lower() in ("quit", "exit"):
+            break
+
+        result = vn.ask(question)
+        if not result:
+            print("No results returned.\n")
+            continue
+
+        df = result["df"]
+        chart_url = result["chart_url"]
+        summary = result["summary"]
+
+        if args.json:
+            print(json.dumps({
+                "data": df.head(100).to_dict(orient="records"),
+                "chart_url": chart_url,
+                "summary": summary
+            }, indent=2))
+        else:
+            print("\nRESULTS (top 10 rows):")
+            print(df.head(10).to_string(index=False))
+            if chart_url:
+                print(f"\nChart URL: {chart_url}")
+            print(f"\nSUMMARY:\n{summary}")
+
+    print("Goodbye!")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+________________________________________________________________________________________________________________________
+
+supervisor_agent/cli.py
+
+#!/usr/bin/env python3
+
+import os
+import openai
+from dotenv import load_dotenv
+
+# === IMPORT AGENTS ===
+from underbilling_agent.cli import (
+    MyVanna as UnderVanna,
+    underbilling_sql_training,
+    underbilling_documentation,
+    ddl_statements as underbilling_ddl,
+)
+from profitability_agent.cli import (
+    MyVanna as ProfitVanna,
+    profitability_risks_sql_training,
+    profitability_risks_documentation,
+    profitability_risks_ddl_statements,
+)
+from cross_matter_rate_consistency_agent.cli import (
+    MyVanna as CrossVanna,
+    cross_matter_rate_consistency_sql_training,
+    cross_matter_rate_consistency_documentation,
+    cross_matter_rate_consistency_ddl_statements,
+)
+
+# === LOAD ENV VARIABLES ===
+load_dotenv()
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+openai.api_key = OPENAI_KEY
+MODEL = os.getenv("MODEL_NAME", "gpt-4o-mini")
+
+shared_config = {
+    "api_key": OPENAI_KEY,
+    "model": MODEL,
+    "embedding_model": "text-embedding-3-small",
+    "allow_llm_to_see_data": True,
+}
+
+# === SETUP UNDERBILLING AGENT ===
+under_vanna = UnderVanna(config=shared_config)
+for sql, q in underbilling_sql_training:
+    under_vanna.train(sql=sql, question=q)
+for doc in underbilling_documentation:
+    under_vanna.train(documentation=doc)
+for ddl in underbilling_ddl:
+    under_vanna.train(ddl=ddl)
+under_vanna.connect_to_postgres(
+    host=os.getenv("POSTGRES_HOST"),
+    dbname=os.getenv("POSTGRES_DB"),
+    user=os.getenv("UNDERBILLING_USER"),
+    password=os.getenv("UNDERBILLING_PASSWORD"),
+    port=int(os.getenv("POSTGRES_PORT", 5432))
+)
+
+# === SETUP PROFITABILITY AGENT ===
+profit_vanna = ProfitVanna(config=shared_config)
+for sql, q in profitability_risks_sql_training:
+    profit_vanna.train(sql=sql, question=q)
+for doc in profitability_risks_documentation:
+    profit_vanna.train(documentation=doc)
+for ddl in profitability_risks_ddl_statements:
+    profit_vanna.train(ddl=ddl)
+profit_vanna.connect_to_postgres(
+    host=os.getenv("POSTGRES_HOST"),
+    dbname=os.getenv("POSTGRES_DB"),
+    user=os.getenv("PROFITABILITY_USER"),
+    password=os.getenv("PROFITABILITY_PASSWORD"),
+    port=int(os.getenv("POSTGRES_PORT", 5432))
+)
+
+# === SETUP CROSS-MATTER AGENT ===
+cross_vanna = CrossVanna(config=shared_config)
+for sql, q in cross_matter_rate_consistency_sql_training:
+    cross_vanna.train(sql=sql, question=q)
+for doc in cross_matter_rate_consistency_documentation:
+    cross_vanna.train(documentation=doc)
+for ddl in cross_matter_rate_consistency_ddl_statements:
+    cross_vanna.train(ddl=ddl)
+cross_vanna.connect_to_postgres(
+    host=os.getenv("POSTGRES_HOST"),
+    dbname=os.getenv("POSTGRES_DB"),
+    user=os.getenv("CROSS_MATTER_AGENT_USER"),
+    password=os.getenv("CROSS_MATTER_AGENT_PASSWORD"),
+    port=int(os.getenv("POSTGRES_PORT", 5432))
+)
+
+# === SUPERVISOR PROMPT ===
+SUPERVISOR_PROMPT = """
+You are the Legal Billing Supervisor Agent. Your task is to classify a user's question and route it to one of three specialized agents, each focused on a distinct type of analysis.
+
+You must return ONLY one of the following tokens:
+- underbilling
+- profitability
+- cross_matter
+
+No other text. Just the token.
+
+---
+
+Agent: **underbilling**
+
+Focuses on identifying cases where actual billed rates are lower than standard rates, or where non-billable, discounted, or zero-charge timecards suggest revenue leakage.
+
+Detection logic:
+- If actual rate < 60% of standard rate for at least two consecutive months, flag it.
+- Metrics: worked_rate, standard_rate, worked_amount, standard_amount, discount %
+- Also monitors: timekeeper roles (e.g. senior partners billing low), repeated underbilling, or billing mismatches.
+
+Example questions:
+- "Which timecards are below 60% of standard rate?"
+- "Who billed below standard for three months?"
+- "Are there any timekeepers discounting heavily?"
+
+---
+
+Agent: **profitability**
+
+Evaluates profitability risks using realization rate, billing efficiency, collections, and discounts by practice area.
+
+Detection logic:
+- Group by practice area
+- If discount > 25% OR realization < 80%, flag as risk
+- Analyze timecard-based and matter-based billing efficiency
+
+Example questions:
+- "Which practice groups have low realization?"
+- "Identify profitability risks by area"
+- "Where is the revenue vs cost mismatch?"
+
+---
+
+Agent: **cross_matter**
+
+Detects inconsistencies in rate usage across matters or clients.
+
+Detection logic:
+- Compare rates across multiple matters under the same client
+- If a matter deviates from client-average discount by more than 10%, flag it
+- Highlight matters using inconsistent currencies or rate sets
+
+Example questions:
+- "Which matters have inconsistent rates for the same client?"
+- "Are there currency mismatches in standard rates?"
+- "Find matters using deviated rate details"
+
+---
+
+Classify based on intent and logic match. Return ONLY one of:
+- underbilling
+- profitability
+- cross_matter
+"""
+
+def choose_agent(question: str) -> str:
+    resp = openai.chat.completions.create(
+        model=MODEL,
+        temperature=0.0,
+        messages=[
+            {"role": "system", "content": SUPERVISOR_PROMPT},
+            {"role": "user", "content": question},
+        ]
+    )
+    agent_type_raw = resp.choices[0].message.content
+    cleaned = agent_type_raw.strip().lower()
+    print(f"[DEBUG] LLM raw response: {repr(agent_type_raw)}")
+    print(f"[DEBUG] Normalized agent type: '{cleaned}'")
+    return cleaned
+
+def print_result(result):
+    df = result.get("df")
+    chart_url = result.get("chart_url")
+    summary = result.get("summary")
+
+    print("\n📊 TOP 10 RESULTS:")
+    if df is not None and not df.empty:
+        print(df.head(10).to_string(index=False))
+    else:
+        print("No data returned.")
+
+    if chart_url:
+        print(f"\n📈 CHART: {chart_url}")
+
+    if summary:
+        print(f"\n🧠 SUMMARY:\n{summary}")
+
+# === MAIN LOOP ===
+if __name__ == "__main__":
+    print("🔍 Supervisor Agent ready. (type 'quit' to exit')")
+    while True:
+        q = input("\n> ").strip()
+        if not q or q.lower() in ("quit", "exit"):
+            break
+
+        agent_type = choose_agent(q)
+
+        result = None
+        if agent_type == "underbilling":
+            print("📌 Routing to Underbilling Agent...")
+            result = under_vanna.ask(q)
+        elif agent_type == "profitability":
+            print("📌 Routing to Profitability Agent...")
+            result = profit_vanna.ask(q)
+        elif agent_type in ("cross_matter", "cross-matter"):
+            print("📌 Routing to Cross-Matter Consistency Agent...")
+            result = cross_vanna.ask(q)
+        else:
+            print(f"❓ Unrecognized agent: '{agent_type}'")
+            continue
+
+        if result:
+            print_result(result)
+        else:
+            print("⚠️ No response from selected agent.")
+
+    print("\n👋 Goodbye!")
+
+
+
+_________________________________________________________________________________________________________________________
+
+
+.env
+
+OPENAI_API_KEY=sk-......................................................................
+MODEL_NAME=gpt-4o-mini-2024-07-18
+
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_DB=WyzeRates
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=......
+
+UNDERBILLING_USER = underbilling_user
+UNDERBILLING_PASSWORD=.....
+PROFITABILITY_USER = profitability_user
+PROFITABILITY_PASSWORD=.....
+CROSS_MATTER_AGENT_USER = cross_matter_agent_user
+CROSS_MATTER_AGENT_PASSWORD = .....
+
+
+Commands to run :
+
+/OWN-PROJECT$ python -m supervisor_agent.cli
+    |
+  folder
+
+In another terminal =>  OWN-PROJECT$ cd /tmp/underbilling_cli_charts
+
+                        /tmp/underbilling_cli_charts$ python3 -m http.server 8000

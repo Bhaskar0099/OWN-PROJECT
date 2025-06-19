@@ -1,7 +1,10 @@
+#!/usr/bin/env python3
 import os
 import uuid
 import json
 import argparse
+import tempfile
+
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -14,62 +17,18 @@ import openai
 from vanna.openai import OpenAI_Chat
 from vanna.chromadb import ChromaDB_VectorStore
 
-# ───────────────────────────────────────────────────────────────────
-# Prevent Plotly from auto‐opening a browser:
+from decimal import Decimal
+
+# Prevent Plotly from auto‐opening a browser
 pio.renderers.default = "svg"
 _bdt.BaseFigure.show = lambda *args, **kwargs: None
-# ───────────────────────────────────────────────────────────────────
 
+# Load .env
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 
-class MyVanna(ChromaDB_VectorStore, OpenAI_Chat):
-    def __init__(self, config=None):
-        ChromaDB_VectorStore.__init__(self, config=config)
-        OpenAI_Chat.__init__(self, config=config)
-        self._last_query_df = None
-
-    def ask(self, question, **kwargs):
-        """
-        Call parent .ask(…) which may return:
-          • None
-          • a DataFrame
-          • (sql, DataFrame)
-          • (sql, DataFrame, Figure)
-        Normalize to (DataFrame, Figure) or None.
-        """
-        result = super().ask(question, **kwargs)
-        if result is None:
-            return None
-
-        if isinstance(result, tuple):
-            # (sql, df, fig)
-            if len(result) == 3 and isinstance(result[2], _bdt.BaseFigure):
-                sql, df, fig = result
-                self._last_query_df = df
-                return df, fig
-            # (sql, df)
-            if len(result) >= 2 and isinstance(result[1], pd.DataFrame):
-                sql, df = result[0], result[1]
-                self._last_query_df = df
-                return df, None
-            # (df,)
-            if isinstance(result[0], pd.DataFrame):
-                df = result[0]
-                self._last_query_df = df
-                return df, None
-            return None
-
-        if isinstance(result, pd.DataFrame):
-            self._last_query_df = result
-            return result, None
-
-        return None
-
-
 def summarize(question: str, records: list[dict]) -> str:
-    """Generate a concise narrative summary via gpt-4.1-nano."""
     system_msg = (
         "You are a data-analysis assistant. "
         "When given a user’s question and a JSON array of row objects, "
@@ -90,10 +49,78 @@ def summarize(question: str, records: list[dict]) -> str:
     )
     return resp.choices[0].message.content.strip()
 
+def convert_decimals(obj):
+    """
+    Recursively convert Decimal objects → float so json.dumps() won't choke.
+    """
+    if isinstance(obj, list):
+        return [convert_decimals(v) for v in obj]
+    if isinstance(obj, dict):
+        return {k: convert_decimals(v) for k, v in obj.items()}
+    if isinstance(obj, Decimal):
+        return float(obj)
+    return obj
 
-# ───────────────────────────────────────────────────────────────────
-# Training data
-# ───────────────────────────────────────────────────────────────────
+
+class MyVanna(ChromaDB_VectorStore, OpenAI_Chat):
+    def __init__(self, config=None):
+        ChromaDB_VectorStore.__init__(self, config=config)
+        OpenAI_Chat.__init__(self, config=config)
+
+    def ask(self, question, **kwargs):
+        result = super().ask(question, **kwargs)
+        if result is None:
+            return None
+
+        df, fig = None, None
+        if isinstance(result, tuple):
+            if len(result) == 3 and isinstance(result[2], _bdt.BaseFigure):
+                _, df, fig = result
+            elif len(result) >= 2 and isinstance(result[1], pd.DataFrame):
+                _, df = result[0], result[1]
+            elif isinstance(result[0], pd.DataFrame):
+                df = result[0]
+        elif isinstance(result, pd.DataFrame):
+            df = result
+
+        if df is None or df.empty:
+            return None
+
+        html_str = None
+        if fig and isinstance(fig, (_bdt.BaseFigure, go.Figure)):
+            html_str = fig.to_html(include_plotlyjs="cdn")
+        elif len(df.columns) >= 2:
+            x, y = df.columns[:2]
+            fallback = px.bar(df.head(10), x=x, y=y, title=f"{y} by {x}")
+            html_str = fallback.to_html(include_plotlyjs="cdn")
+
+        chart_url = None
+        if html_str:
+            charts_dir = os.getenv("CHARTS_DIR", os.path.join(tempfile.gettempdir(), "underbilling_cli_charts"))
+            os.makedirs(charts_dir, exist_ok=True)
+            chart_filename = f"{uuid.uuid4()}.html"
+            chart_path = os.path.join(charts_dir, chart_filename)
+            with open(chart_path, "w", encoding="utf-8") as f:
+                f.write(html_str)
+            chart_url = f"http://127.0.0.1:8000/{chart_filename}"
+
+        records = df.head(100).copy()
+        for col in records.select_dtypes(include=["datetime64[ns]"]):
+            records[col] = records[col].dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+        data = convert_decimals(records.to_dict(orient="records"))
+
+        try:
+            summary = summarize(question, data)
+        except Exception as e:
+            summary = f"Could not generate summary: {e}"
+
+        return {
+            "df": df,
+            "chart_url": chart_url,
+            "summary": summary
+        }
+
 
 cross_matter_rate_consistency_sql_training = [
     (
@@ -672,24 +699,21 @@ cross_matter_rate_consistency_ddl_statements = [
     'Adding ddl: CREATE TABLE client ("client_id" TEXT, "client_name" TEXT, "is_active" TEXT);'
 ]
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Underbilling CLI")
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit a JSON response instead of human-readable output",
-    )
+    parser = argparse.ArgumentParser(description="Cross Matter Rate Consistency CLI")
+    parser.add_argument("--json", action="store_true", help="Emit JSON output")
     args = parser.parse_args()
 
-    # 1) Instantiate and configure Vanna
-    vn = MyVanna(config={
+    config = {
         'api_key': os.getenv('OPENAI_API_KEY'),
         'model': os.getenv('MODEL_NAME', 'gpt-4o-mini'),
         'embedding_model': 'text-embedding-3-small',
         'allow_llm_to_see_data': True,
-    })
+    }
 
-    # 2) Train Vanna
+    vn = MyVanna(config=config)
+
     for sql, question in cross_matter_rate_consistency_sql_training:
         vn.train(sql=sql, question=question)
 
@@ -699,83 +723,43 @@ def main():
     for ddl in cross_matter_rate_consistency_ddl_statements:
         vn.train(ddl=ddl)
 
-    # 3) Connect to PostgreSQL
     vn.connect_to_postgres(
-        host=os.getenv('POSTGRES_HOST'),
-        dbname=os.getenv('POSTGRES_DB'),
-        user=os.getenv('CROSS_MATTER_AGENT_USER'),
-        password=os.getenv('CROSS_MATTER_AGENT_PASSWORD'),
-        port=int(os.getenv('POSTGRES_PORT', 5432))
+        host=os.getenv("POSTGRES_HOST"),
+        dbname=os.getenv("POSTGRES_DB"),
+        user=os.getenv("CROSS_MATTER_AGENT_USER"),
+        password=os.getenv("CROSS_MATTER_AGENT_PASSWORD"),
+        port=int(os.getenv("POSTGRES_PORT", 5432))
     )
 
-    # Ensure charts directory exists
-    os.makedirs("charts", exist_ok=True)
-
-    print("Cross Matter Rate Consistency Agent-CLI ready. Type your question (or ‘quit’ to exit).")
+    print("Cross Matter Rate Consistency Agent ready. Type your question (or ‘quit’ to exit).")
     while True:
         question = input("\n> ").strip()
         if not question or question.lower() in ("quit", "exit"):
             break
 
         result = vn.ask(question)
-        if result is None:
-            if not args.json:
-                print("No results returned.\n")
+        if not result:
+            print("No results returned.\n")
             continue
 
-        df, fig = result
-        if df is None or df.empty:
-            if not args.json:
-                print("No results returned.\n")
-            continue
-
-        # 4) Save or generate chart
-        chart_id = uuid.uuid4().hex
-        chart_filename = f"{chart_id}.html"
-        chart_path = os.path.join("charts", chart_filename)
-        if isinstance(fig, (_bdt.BaseFigure, go.Figure)):
-            chosen_fig = fig
-        elif len(df.columns) >= 2:
-            x, y = df.columns[0], df.columns[1]
-            chosen_fig = px.bar(df.head(10), x=x, y=y, title=f"{y} by {x}")
-        else:
-            chosen_fig = None
-
-        chart_url = None
-        if chosen_fig:
-            chosen_fig.write_html(chart_path, include_plotlyjs="cdn")
-            chart_url = f"http://127.0.0.1:8000/{chart_filename}"
-
-        # 5) Prepare JSON-friendly data
-        records = df.head(100).copy()
-        for col in records.select_dtypes(include=["datetime64[ns]"]):
-            records[col] = records[col].dt.strftime("%Y-%m-%dT%H:%M:%S")
-        data = records.to_dict(orient="records")
-
-        # 6) Generate summary
-        try:
-            summary = summarize(question, data)
-        except Exception as e:
-            summary = f"Could not generate summary: {e}"
-
-        # 7) Emit output
-        payload = {
-            "data": data,
-            "chart_url": chart_url,
-            "summary": summary
-        }
+        df = result["df"]
+        chart_url = result["chart_url"]
+        summary = result["summary"]
 
         if args.json:
-            print(json.dumps(payload, indent=2))
+            print(json.dumps({
+                "data": convert_decimals(df.head(100).to_dict(orient="records")),
+                "chart_url": chart_url,
+                "summary": summary
+            }, indent=2))
         else:
-            # human-readable fallback
             print("\nRESULTS (top 10 rows):")
             print(df.head(10).to_string(index=False))
             if chart_url:
                 print(f"\nChart URL: {chart_url}")
             print(f"\nSUMMARY:\n{summary}")
 
-    print("\nGoodbye!")
+    print("Goodbye!")
 
 
 if __name__ == "__main__":
