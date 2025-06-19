@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "WyzeAssist==============",
+			"path": "../.."
+		},
+		{
+			"name": "kb",
+			"path": "../../../kb"
+		}
+	],
+	"settings": {}
+}
